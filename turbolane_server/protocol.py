@@ -58,8 +58,19 @@ MAGIC = 0x544C414E          # "TLAN"
 # to:
 #   "!IBHIIIQII"  → magic(I) type(B) stream_id(H) chunk_idx(I) ...
 # Total header size increases from 30 → 31 bytes.
-HEADER_FORMAT = "!IBHIIIQii"  # big-endian: magic(I) type(B) stream_id(H) chunk_idx(I) total_chunks(I) seq(I) file_offset(Q) data_len(i) checksum(i)
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # 31 bytes
+# Format breakdown — all big-endian (!):
+#   I  = magic        (4 bytes, unsigned int)
+#   B  = msg_type     (1 byte,  unsigned char)
+#   H  = stream_id    (2 bytes, unsigned short)   ← changed from B (1 byte)
+#   I  = chunk_idx    (4 bytes, unsigned int)
+#   I  = total_chunks (4 bytes, unsigned int)
+#   I  = seq          (4 bytes, unsigned int)
+#   Q  = file_offset  (8 bytes, unsigned long long)
+#   I  = data_len     (4 bytes, unsigned int)
+#   I  = checksum     (4 bytes, unsigned int)
+# Total: 4+1+2+4+4+4+8+4+4 = 35 bytes
+HEADER_FORMAT = "!IBHIIIQII"
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # 35 bytes
 
 CHUNK_SIZE = 1 * 1024 * 1024   # 1 MB default chunk size
 RECV_BUFFER = 65536             # socket recv buffer

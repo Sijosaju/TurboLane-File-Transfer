@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
-  "saved_at": 1771686757.9586222,
-  "saved_at_human": "2026-02-21 15:12:37 UTC",
+  "saved_at": 1771687568.3766623,
+  "saved_at_human": "2026-02-21 15:26:08 UTC",
   "q_table": {
     "(3, 0, 0)": {
       "0": -0.20709853514045629,
@@ -104,15 +104,15 @@
   },
   "stats": {
     "q_table_states": 14,
-    "current_connections": 3,
+    "current_connections": 6,
     "exploration_rate": 0.05,
     "total_decisions": 504,
     "total_updates": 500,
-    "average_reward": -1.3863,
-    "total_reward": -693.1455,
-    "positive_rewards": 4,
-    "negative_rewards": 396,
-    "throughput_improvements": 48,
+    "average_reward": 0.0,
+    "total_reward": 0.0,
+    "positive_rewards": 0,
+    "negative_rewards": 0,
+    "throughput_improvements": 0,
     "monitoring_interval": 5.0
   }
 }
