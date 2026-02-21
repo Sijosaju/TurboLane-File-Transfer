@@ -45,7 +45,7 @@ from turbolane_server.protocol import (
 logger = logging.getLogger(__name__)
 
 # How long to wait for the next frame before timing out a stream
-STREAM_TIMEOUT = 30.0
+STREAM_TIMEOUT = 120.0
 
 # Directory where received files are saved (overridden by CLI)
 DEFAULT_OUTPUT_DIR = "./received"

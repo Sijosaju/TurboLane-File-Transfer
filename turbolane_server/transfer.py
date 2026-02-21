@@ -41,9 +41,17 @@ from turbolane_server.metrics import MetricsCollector, StreamMetrics
 logger = logging.getLogger(__name__)
 
 # How long a worker waits for an ACK before considering a chunk lost
-ACK_TIMEOUT = 10.0          # seconds
+# FIX #1: Increased from 10.0 → 30.0 to tolerate real Wi-Fi LAN latency.
+# Over localhost this was fine; over Wi-Fi with 1 MB chunks and TCP congestion
+# 10s was too tight and caused spurious timeouts + stream churn.
+ACK_TIMEOUT = 30.0          # seconds (was 10.0)
+
 PING_INTERVAL = 4.0         # seconds between RTT probes per stream
-CONNECT_TIMEOUT = 10.0      # seconds to establish stream connection
+
+# FIX #2: Increased from 10.0 → 20.0 to give the receiver's TCP stack more
+# time to accept connections when many streams are being spawned rapidly.
+CONNECT_TIMEOUT = 20.0      # seconds (was 10.0)
+
 MAX_CHUNK_RETRIES = 3       # retransmit attempts before giving up
 
 
@@ -391,6 +399,14 @@ class TransferSession:
         self._done_event = threading.Event()
         self._error: Optional[str] = None
 
+        # FIX #3: Monotonically increasing stream ID counter.
+        # Previously, _spawn_stream(stream_id) reused IDs after streams were
+        # stopped, causing a race where two workers briefly shared the same ID
+        # and self._workers[stream_id] was silently overwritten. Now every
+        # spawned stream gets a unique ID regardless of how many have been
+        # stopped and restarted.
+        self._next_stream_id = 0
+
         # Progress monitor thread
         self._monitor_thread: Optional[threading.Thread] = None
 
@@ -407,8 +423,8 @@ class TransferSession:
     def start(self) -> None:
         """Spawn initial worker streams and begin transfer."""
         self._start_time = time.monotonic()
-        for i in range(self._target_streams):
-            self._spawn_stream(i)
+        for _ in range(self._target_streams):
+            self._spawn_stream()
 
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop,
@@ -437,9 +453,9 @@ class TransferSession:
             self._target_streams = new_count
 
         if new_count > current:
-            for i in range(current, new_count):
-                logger.info("Adapter: adding stream %d (total → %d)", i, new_count)
-                self._spawn_stream(i)
+            for _ in range(new_count - current):
+                logger.info("Adapter: adding stream (total → %d)", new_count)
+                self._spawn_stream()
 
         elif new_count < current:
             # Stop excess streams (highest IDs first, least likely to have work)
@@ -488,7 +504,12 @@ class TransferSession:
     # Internal: stream management
     # ------------------------------------------------------------------
 
-    def _spawn_stream(self, stream_id: int) -> None:
+    def _spawn_stream(self) -> None:
+        # FIX #3: Always use a fresh, never-reused stream ID.
+        with self._lock:
+            stream_id = self._next_stream_id
+            self._next_stream_id += 1
+
         sm = self.metrics.register_stream(stream_id)
         worker = StreamWorker(
             stream_id=stream_id,
