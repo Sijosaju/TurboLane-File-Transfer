@@ -185,6 +185,36 @@ class StreamWorker:
         logger.info("Stream %d: started → %s:%d", self.stream_id, self.host, self.port)
         return True
 
+    def send_transfer_done(self) -> None:
+        """
+        FIX (Bug 1): Send TRANSFER_DONE frame and wait for COMPLETE response
+        before the socket is closed. Previously the socket was closed abruptly
+        which caused WinError 10054/10053 (connection reset/aborted) on the
+        server side as it was still blocked on recv_frame() waiting for the
+        next message.
+        """
+        if self._sock is None:
+            return
+        try:
+            # Wire protocol: stream_id field is 1 byte (0-255).
+            # FIX (Bug 2): mask to 8 bits so IDs > 255 don't corrupt the frame.
+            wire_id = self.stream_id & 0xFF
+            frame = encode_frame(
+                msg_type=MessageType.TRANSFER_DONE,
+                stream_id=wire_id,
+            )
+            self._sock.sendall(frame)
+            # Drain responses until we get COMPLETE (ignore interleaved PONGs)
+            while True:
+                hdr, _payload = recv_frame(self._sock)
+                if hdr["msg_type"] == MessageType.PONG:
+                    continue
+                if hdr["msg_type"] == MessageType.COMPLETE:
+                    logger.info("Stream %d: COMPLETE received", self.stream_id)
+                break
+        except OSError as exc:
+            logger.warning("Stream %d: send_transfer_done error: %s", self.stream_id, exc)
+
     def stop(self) -> None:
         """Signal this stream to stop after finishing its current chunk."""
         self._stop_event.set()
@@ -216,7 +246,7 @@ class StreamWorker:
         }
         frame = encode_frame(
             msg_type=MessageType.HELLO,
-            stream_id=self.stream_id,
+            stream_id=self.stream_id & 0xFF,   # FIX (Bug 2): mask to wire width
             payload=encode_meta(meta),
         )
         try:
@@ -269,7 +299,7 @@ class StreamWorker:
 
                         frame = encode_frame(
                             msg_type=MessageType.CHUNK,
-                            stream_id=self.stream_id,
+                            stream_id=self.stream_id & 0xFF,   # FIX (Bug 2)
                             chunk_idx=chunk_idx,
                             total_chunks=self._total_chunks,
                             seq=chunk_idx,
@@ -341,7 +371,7 @@ class StreamWorker:
         try:
             frame = encode_frame(
                 msg_type=MessageType.PING,
-                stream_id=self.stream_id,
+                stream_id=self.stream_id & 0xFF,   # FIX (Bug 2)
             )
             self._sm.record_ping_sent()
             self._sock.sendall(frame)
@@ -576,11 +606,26 @@ class TransferSession:
                     self._end_time - self._start_time,
                     (self._file_size * 8) / ((self._end_time - self._start_time) * 1e6),
                 )
-                # Stop all streams cleanly
+
+                # FIX (Bug 1): Send TRANSFER_DONE on every active stream and wait
+                # for the server's COMPLETE response BEFORE closing the socket.
+                # Previously, _stop_stream() closed the socket immediately after
+                # all chunks were ACKed, while the server was still blocked on
+                # recv_frame() expecting the next message. That abrupt close
+                # caused WinError 10054 (connection reset) / 10053 (connection
+                # aborted) on the server side, and the last chunk appeared to
+                # not be transmitted because the server-side FileAssembler never
+                # reached its is_complete state cleanly.
                 with self._lock:
                     ids = list(self._workers.keys())
+
                 for sid in ids:
+                    with self._lock:
+                        worker = self._workers.get(sid)
+                    if worker:
+                        worker.send_transfer_done()   # ← graceful protocol close
                     self._stop_stream(sid)
+
                 self.metrics.unregister_all()
                 self._done_event.set()
                 break

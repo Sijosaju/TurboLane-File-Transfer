@@ -9,14 +9,15 @@ Frame layout (all fields big-endian):
 ├──────────────┼───────┼───────────────────────────────────────────────────┤
 │ magic        │   4   │ 0x544C414E  ("TLAN") — frame start sentinel       │
 │ msg_type     │   1   │ MessageType enum                                   │
-│ stream_id    │   1   │ Which parallel stream (0-255)                      │
+│ stream_id    │   2   │ Which parallel stream (0-65535)  ← FIX: was 1 byte│
 │ chunk_idx    │   4   │ This chunk's index within the file                 │
 │ total_chunks │   4   │ Total number of chunks in the transfer             │
+│ seq          │   4   │ Sequence number                                    │
 │ file_offset  │   8   │ Byte offset in the original file                   │
 │ data_len     │   4   │ Payload length in bytes (0 for control frames)     │
 │ checksum     │   4   │ CRC32 of the payload (0 for control frames)        │
 ├──────────────┼───────┼───────────────────────────────────────────────────┤
-│ TOTAL HEADER │  30   │                                                    │
+│ TOTAL HEADER │  31   │ (was 30 — stream_id grew by 1 byte)               │
 └──────────────┴───────┴───────────────────────────────────────────────────┘
 │ payload      │ data_len bytes │ Raw file chunk bytes                      │
 └──────────────┴────────────────┴───────────────────────────────────────────┘
@@ -43,8 +44,22 @@ from enum import IntEnum
 # Constants
 # ------------------------------------------------------------------
 MAGIC = 0x544C414E          # "TLAN"
-HEADER_FORMAT = "!IBBIIIQII"  # big-endian: magic(I) type(B) stream_id(B) chunk_idx(I) total_chunks(I) seq(I) file_offset(Q) data_len(I) checksum(I)
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # 30 bytes
+
+# FIX (Bug 2): stream_id expanded from 1 byte (B / max 255) to 2 bytes (H /
+# max 65535). The TransferSession uses a monotonically increasing stream ID
+# counter (_next_stream_id) that is never reset. With the old 1-byte field,
+# any transfer that spawned more than 256 streams (common with the RL adapter
+# cycling streams over a long run) would silently alias IDs modulo 256, causing
+# CHUNK_ACKs and PONG frames to be correlated to the wrong stream worker.
+#
+# IMPORTANT: Both the sender and receiver must use this updated protocol.py.
+# The field order changed from:
+#   "!IBBIIIQII"  → magic(I) type(B) stream_id(B) chunk_idx(I) ...
+# to:
+#   "!IBHIIIQII"  → magic(I) type(B) stream_id(H) chunk_idx(I) ...
+# Total header size increases from 30 → 31 bytes.
+HEADER_FORMAT = "!IBHIIIQii"  # big-endian: magic(I) type(B) stream_id(H) chunk_idx(I) total_chunks(I) seq(I) file_offset(Q) data_len(i) checksum(i)
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # 31 bytes
 
 CHUNK_SIZE = 1 * 1024 * 1024   # 1 MB default chunk size
 RECV_BUFFER = 65536             # socket recv buffer
@@ -83,7 +98,7 @@ def encode_frame(
 
     Args:
         msg_type:     MessageType enum value
-        stream_id:    Which parallel stream (0-indexed)
+        stream_id:    Which parallel stream (0-indexed, up to 65535)
         chunk_idx:    Chunk index within the file
         total_chunks: Total chunks in this transfer
         seq:          Sequence number (for ordering / ACK correlation)
@@ -100,7 +115,7 @@ def encode_frame(
         HEADER_FORMAT,
         MAGIC,
         int(msg_type),
-        stream_id & 0xFF,
+        stream_id & 0xFFFF,   # FIX (Bug 2): mask to 2-byte wire width
         chunk_idx,
         total_chunks,
         seq,
@@ -113,7 +128,7 @@ def encode_frame(
 
 def decode_header(raw: bytes) -> dict:
     """
-    Unpack a raw 30-byte header into a dict.
+    Unpack a raw 31-byte header into a dict.
 
     Raises:
         ValueError: if magic bytes don't match or header is truncated
