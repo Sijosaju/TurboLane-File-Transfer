@@ -27,7 +27,7 @@ import socket
 import threading
 import time
 import logging
-import json
+import queue
 import signal
 import sys
 from pathlib import Path
@@ -35,7 +35,6 @@ from typing import Optional
 
 from turbolane_server.protocol import (
     MessageType,
-    HEADER_SIZE,
     encode_frame,
     encode_meta,
     decode_meta,
@@ -47,8 +46,24 @@ logger = logging.getLogger(__name__)
 # How long to wait for the next frame before timing out a stream
 STREAM_TIMEOUT = 120.0
 
+# If no activity is observed for this long, abandon the partial transfer.
+STALE_TRANSFER_TIMEOUT = 180.0
+
+# Number of chunks buffered for async disk writer (0 = unbounded).
+WRITE_QUEUE_MAX = 0
+
 # Directory where received files are saved (overridden by CLI)
 DEFAULT_OUTPUT_DIR = "./received"
+
+
+def _sanitize_file_name(raw_name: str) -> str:
+    """
+    Keep only the leaf filename to prevent directory traversal.
+    """
+    name = Path(str(raw_name)).name
+    if not name or name in {".", ".."}:
+        raise ValueError("Invalid file_name metadata")
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -78,9 +93,12 @@ class FileAssembler:
         self.output_dir   = output_dir
 
         self._lock      = threading.Lock()
-        self._acked     = set()
+        self._acked     = set()      # chunks durably written
+        self._seen      = set()      # chunks accepted (queued or written)
         self._complete  = threading.Event()
         self._error: Optional[str] = None
+        self._last_activity = time.monotonic()
+        self._closed = False
 
         # Pre-allocate the output file
         out_path = Path(output_dir) / file_name
@@ -88,8 +106,25 @@ class FileAssembler:
         self.output_path = str(out_path)
 
         with open(self.output_path, "wb") as fh:
-            fh.seek(file_size - 1)
-            fh.write(b"\x00")
+            if file_size > 0:
+                fh.seek(file_size - 1)
+                fh.write(b"\x00")
+
+        # Keep one fd open for the full transfer to avoid per-chunk open/close.
+        self._fh = open(self.output_path, "r+b")
+
+        # Writer thread decouples ACK timing from disk latency.
+        self._write_queue: queue.Queue = queue.Queue(maxsize=WRITE_QUEUE_MAX)
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            name=f"writer-{transfer_id}",
+            daemon=True,
+        )
+        self._writer_thread.start()
+
+        if self.total_chunks == 0:
+            self._complete.set()
+            logger.info("FileAssembler %s: zero-byte transfer", transfer_id)
 
         logger.info(
             "FileAssembler %s: pre-allocated %s (%d bytes)",
@@ -98,27 +133,88 @@ class FileAssembler:
 
     def write_chunk(self, chunk_idx: int, file_offset: int, data: bytes) -> bool:
         """
-        Write one chunk to the pre-allocated file.
+        Queue one chunk for async write.
         Returns True if this was a new chunk (not a duplicate).
         """
         with self._lock:
-            if chunk_idx in self._acked:
-                return False   # duplicate, ignore
-            # Write under lock to prevent fd seek/write races
-            with open(self.output_path, "r+b") as fh:
-                fh.seek(file_offset)
-                fh.write(data)
-            self._acked.add(chunk_idx)
-            done = len(self._acked) >= self.total_chunks
+            self._last_activity = time.monotonic()
+            if self._closed:
+                return False
+            if chunk_idx in self._seen:
+                return False
+            self._seen.add(chunk_idx)
 
-        if done:
-            logger.info(
-                "FileAssembler %s: all %d chunks received → %s",
-                self.transfer_id, self.total_chunks, self.output_path,
-            )
-            self._complete.set()
-
+        self._write_queue.put((chunk_idx, file_offset, data))
         return True
+
+    def _writer_loop(self) -> None:
+        while True:
+            item = self._write_queue.get()
+            if item is None:
+                self._write_queue.task_done()
+                break
+
+            chunk_idx, file_offset, data = item
+            try:
+                self._fh.seek(file_offset)
+                self._fh.write(data)
+
+                with self._lock:
+                    self._acked.add(chunk_idx)
+                    self._last_activity = time.monotonic()
+                    done = len(self._acked) >= self.total_chunks
+
+                if done:
+                    logger.info(
+                        "FileAssembler %s: all %d chunks received -> %s",
+                        self.transfer_id,
+                        self.total_chunks,
+                        self.output_path,
+                    )
+                    self._complete.set()
+
+            except Exception as exc:
+                with self._lock:
+                    self._error = str(exc)
+                logger.error(
+                    "FileAssembler %s write error on chunk %d: %s",
+                    self.transfer_id,
+                    chunk_idx,
+                    exc,
+                )
+            finally:
+                self._write_queue.task_done()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+
+        self._write_queue.put(None)
+        self._writer_thread.join(timeout=5.0)
+
+        if self._writer_thread.is_alive():
+            logger.warning(
+                "FileAssembler %s: writer thread did not stop in time",
+                self.transfer_id,
+            )
+            return
+
+        try:
+            self._fh.close()
+        except OSError:
+            pass
+
+    def touch(self) -> None:
+        with self._lock:
+            self._last_activity = time.monotonic()
+
+    def is_stale(self, timeout_s: float) -> bool:
+        with self._lock:
+            if self._complete.is_set():
+                return False
+            return (time.monotonic() - self._last_activity) > timeout_s
 
     def wait_complete(self, timeout: float = None) -> bool:
         return self._complete.wait(timeout=timeout)
@@ -132,14 +228,24 @@ class FileAssembler:
         with self._lock:
             return len(self._acked)
 
+    @property
+    def error(self) -> Optional[str]:
+        with self._lock:
+            return self._error
+
     def get_stats(self) -> dict:
+        progress_pct = (
+            round(self.chunks_received / self.total_chunks * 100, 1)
+            if self.total_chunks > 0
+            else (100.0 if self.is_complete else 0.0)
+        )
         return {
             "transfer_id":     self.transfer_id,
             "file_name":       self.file_name,
             "file_size":       self.file_size,
             "total_chunks":    self.total_chunks,
             "chunks_received": self.chunks_received,
-            "progress_pct":    round(self.chunks_received / self.total_chunks * 100, 1),
+            "progress_pct":    progress_pct,
             "complete":        self.is_complete,
             "output_path":     self.output_path,
         }
@@ -218,10 +324,29 @@ class StreamHandler:
         meta = decode_meta(payload)
         transfer_id  = meta["transfer_id"]
         stream_id    = meta["stream_id"]
-        file_name    = meta["file_name"]
+        raw_file_name = meta["file_name"]
         file_size    = meta["file_size"]
         total_chunks = meta["total_chunks"]
         self._stream_id = stream_id
+
+        try:
+            file_name = _sanitize_file_name(raw_file_name)
+        except ValueError as exc:
+            logger.warning("Stream %d: invalid file_name '%s': %s", stream_id, raw_file_name, exc)
+            err = encode_frame(
+                msg_type=MessageType.ERROR,
+                stream_id=stream_id,
+                payload=encode_meta({"reason": "Invalid file_name metadata"}),
+            )
+            self._conn.sendall(err)
+            return
+        if file_name != raw_file_name:
+            logger.warning(
+                "Stream %d: normalized file_name '%s' -> '%s'",
+                stream_id,
+                raw_file_name,
+                file_name,
+            )
 
         with self._registry_lock:
             if transfer_id not in self._assemblers:
@@ -251,6 +376,7 @@ class StreamHandler:
                 )
             else:
                 assembler = self._assemblers[transfer_id]
+                assembler.touch()
 
         self._assembler = assembler
 
@@ -279,6 +405,8 @@ class StreamHandler:
         self._conn.sendall(ack)
 
     def _handle_ping(self, hdr: dict) -> None:
+        if self._assembler is not None:
+            self._assembler.touch()
         pong = encode_frame(
             msg_type=MessageType.PONG,
             stream_id=self._stream_id,
@@ -289,6 +417,33 @@ class StreamHandler:
     def _handle_done(self) -> None:
         if self._assembler is None:
             return
+        self._assembler.touch()
+
+        # COMPLETE means durable assembly is done, not just queued.
+        if not self._assembler.wait_complete(timeout=STREAM_TIMEOUT):
+            err = encode_frame(
+                msg_type=MessageType.ERROR,
+                stream_id=self._stream_id,
+                payload=encode_meta({"reason": "Timed out waiting for file assembly"}),
+            )
+            self._conn.sendall(err)
+            logger.warning("Stream %d: TRANSFER_DONE before assembly completion", self._stream_id)
+            return
+
+        if self._assembler.error:
+            err = encode_frame(
+                msg_type=MessageType.ERROR,
+                stream_id=self._stream_id,
+                payload=encode_meta({"reason": self._assembler.error}),
+            )
+            self._conn.sendall(err)
+            logger.warning(
+                "Stream %d: assembly error before COMPLETE: %s",
+                self._stream_id,
+                self._assembler.error,
+            )
+            return
+
         complete = encode_frame(
             msg_type=MessageType.COMPLETE,
             stream_id=self._stream_id,
@@ -298,10 +453,15 @@ class StreamHandler:
         logger.info("Stream %d: TRANSFER_DONE acknowledged", self._stream_id)
 
     def _handle_status(self) -> None:
-        if self._assembler:
-            stats = self._assembler.get_stats()
-        else:
+        with self._registry_lock:
+            active = next(iter(self._assemblers.values()), None)
+
+        if active is None:
             stats = {"status": "idle"}
+        else:
+            stats = active.get_stats()
+            stats["status"] = "active"
+
         resp = encode_frame(
             msg_type=MessageType.STATUS_RESP,
             payload=encode_meta(stats),
@@ -427,8 +587,13 @@ class TurboLaneServer:
                     tid for tid, asm in self._assemblers.items()
                     if asm.is_complete
                 ]
+                stale = [
+                    tid for tid, asm in self._assemblers.items()
+                    if asm.is_stale(STALE_TRANSFER_TIMEOUT)
+                ]
                 for tid in completed:
                     asm = self._assemblers.pop(tid)
+                    asm.close()
                     logger.info(
                         "Transfer %s complete — %s",
                         tid, asm.output_path,
@@ -438,7 +603,20 @@ class TurboLaneServer:
                         f"  ({asm.file_size/1e6:.1f} MB) → {asm.output_path}\n"
                     )
 
-                if completed and not self._assemblers:
+                for tid in stale:
+                    asm = self._assemblers.pop(tid)
+                    asm.close()
+                    logger.warning(
+                        "Transfer %s timed out after %.0fs without activity; marking failed",
+                        tid,
+                        STALE_TRANSFER_TIMEOUT,
+                    )
+                    print(
+                        f"\n  ! Transfer aborted (stale): {asm.file_name}"
+                        f"  ({asm.file_size/1e6:.1f} MB)\n"
+                    )
+
+                if self._busy_flag.is_set() and not self._assemblers:
                     self._busy_flag.clear()
                     logger.info("Server: ready for next transfer")
                     print("  Server: ready for next transfer\n")
@@ -449,3 +627,4 @@ class TurboLaneServer:
         if self._sock:
             self._sock.close()
         sys.exit(0)
+
