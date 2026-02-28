@@ -52,6 +52,11 @@ class FederatedPolicy:
         exploration_decay: float = 0.995,
         min_exploration: float = 0.05,
         monitoring_interval: float = 5.0,
+        utility_k: float = 1.0,
+        utility_b: float = 8.0,
+        reward_positive: float = 1.0,
+        reward_negative: float = 1.0,
+        reward_epsilon: float = 0.05,
         auto_save_every: int = 100,    # auto-save every N learning updates
     ):
         """
@@ -68,6 +73,11 @@ class FederatedPolicy:
             exploration_decay:   ε decay per decision
             min_exploration:     Floor for ε
             monitoring_interval: Seconds between decisions (agent self-gates)
+            utility_k:           Utility divisor constant K in U=T/(K*n)-T*L*B
+            utility_b:           Utility loss weight B in U=T/(K*n)-T*L*B
+            reward_positive:     Reward value when utility improves enough
+            reward_negative:     Penalty value when utility drops enough
+            reward_epsilon:      Utility-delta deadband threshold
             auto_save_every:     Persist Q-table every N updates (0 = off)
         """
         self._auto_save_every = auto_save_every
@@ -86,6 +96,11 @@ class FederatedPolicy:
             exploration_decay=exploration_decay,
             min_exploration=min_exploration,
             monitoring_interval=monitoring_interval,
+            utility_k=utility_k,
+            utility_b=utility_b,
+            reward_positive=reward_positive,
+            reward_negative=reward_negative,
+            reward_epsilon=reward_epsilon,
         )
 
         # Load any previously saved Q-table
@@ -207,6 +222,20 @@ class FederatedPolicy:
             # Restore counters
             self._agent.total_decisions = int(metadata.get("total_decisions", 0))
             self._agent.total_updates   = int(metadata.get("total_updates", 0))
+            self._agent.current_connections = max(
+                self._agent.min_connections,
+                min(
+                    self._agent.max_connections,
+                    int(metadata.get("current_connections", self._agent.current_connections)),
+                ),
+            )
+            self._agent._total_reward = float(metadata.get("total_reward", 0.0))
+            self._agent._positive_rewards = int(metadata.get("positive_rewards", 0))
+            self._agent._negative_rewards = int(metadata.get("negative_rewards", 0))
+            self._agent._neutral_rewards = int(metadata.get("neutral_rewards", 0))
+            self._agent._throughput_improvements = int(
+                metadata.get("throughput_improvements", 0)
+            )
             logger.info(
                 "Restored: %d Q-states, %d decisions, ε=%.4f",
                 len(Q),

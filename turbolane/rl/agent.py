@@ -19,14 +19,14 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Action space: index → stream count delta
-# Matches paper's design: aggressive +, conservative +, hold, conservative -, aggressive -
+# Matches the paper's 5-action idea with larger aggressive steps.
 # ---------------------------------------------------------------------------
 ACTIONS = {
-    0: +2,   # aggressive increase
+    0: +5,   # aggressive increase
     1: +1,   # conservative increase
     2:  0,   # hold
     3: -1,   # conservative decrease
-    4: -2,   # aggressive decrease
+    4: -5,   # aggressive decrease
 }
 NUM_ACTIONS = len(ACTIONS)
 
@@ -53,6 +53,11 @@ class RLAgent:
         exploration_decay: float = 0.995,
         min_exploration: float = 0.05,
         monitoring_interval: float = 5.0,
+        utility_k: float = 1.0,
+        utility_b: float = 8.0,
+        reward_positive: float = 1.0,
+        reward_negative: float = 1.0,
+        reward_epsilon: float = 0.05,
     ):
         # Connection bounds
         self.min_connections = min_connections
@@ -69,6 +74,13 @@ class RLAgent:
         # Monitoring interval (agent self-gates decisions)
         self.monitoring_interval = monitoring_interval
         self._last_decision_time: float = 0.0
+
+        # Paper-style utility / reward shaping knobs.
+        self.utility_k = max(1e-6, float(utility_k))
+        self.utility_b = max(0.0, float(utility_b))
+        self.reward_positive = max(0.0, float(reward_positive))
+        self.reward_negative = max(0.0, float(reward_negative))
+        self.reward_epsilon = max(0.0, float(reward_epsilon))
 
         # Q-table: state_tuple → {action_int: q_value}
         self.Q: dict[tuple, dict[int, float]] = {}
@@ -88,7 +100,11 @@ class RLAgent:
         self._total_reward: float = 0.0
         self._positive_rewards: int = 0
         self._negative_rewards: int = 0
+        self._neutral_rewards: int = 0
         self._throughput_improvements: int = 0
+
+        # RTT baseline for paper-style ratio/gradient features.
+        self._min_rtt_ms: float | None = None
 
         logger.info(
             "RLAgent init: connections=[%d..%d] default=%d "
@@ -110,12 +126,11 @@ class RLAgent:
         """
         Map continuous metrics to a discrete state tuple.
 
-        Throughput bins (Mbps): 0-10, 10-50, 50-100, 100-500, 500+
-        RTT bins (ms):          0-30, 30-80, 80-150, 150+
-        Loss bins (%):          0-0.1, 0.1-0.5, 0.5-1.0, 1.0-2.0, 2.0+
-
-        These bins are tuned for research-lab / data-center traffic.
-        Widen or narrow them in config if your link characteristics differ.
+        State follows the paper's spirit more closely than absolute RTT bins:
+          - throughput level
+          - RTT gradient level (trend)
+          - RTT ratio level (current RTT vs historical minimum RTT)
+          - loss level
         """
         # Throughput level (0-4)
         if throughput_mbps < 10:
@@ -129,15 +144,41 @@ class RLAgent:
         else:
             t = 4
 
-        # RTT level (0-3)
-        if rtt_ms < 30:
-            r = 0
-        elif rtt_ms < 80:
-            r = 1
-        elif rtt_ms < 150:
-            r = 2
+        # RTT trend/ratio levels (0-3 each)
+        prev_rtt = (
+            float(self._last_metrics["rtt"])
+            if self._last_metrics is not None
+            else float(rtt_ms)
+        )
+        rtt_gradient = float(rtt_ms) - prev_rtt
+        if rtt_gradient < -5.0:
+            g = 0
+        elif rtt_gradient < 5.0:
+            g = 1
+        elif rtt_gradient < 20.0:
+            g = 2
         else:
-            r = 3
+            g = 3
+
+        if rtt_ms > 0:
+            if self._min_rtt_ms is None:
+                self._min_rtt_ms = float(rtt_ms)
+            else:
+                self._min_rtt_ms = min(self._min_rtt_ms, float(rtt_ms))
+
+        if self._min_rtt_ms and self._min_rtt_ms > 0:
+            rtt_ratio = float(rtt_ms) / self._min_rtt_ms
+        else:
+            rtt_ratio = 1.0
+
+        if rtt_ratio < 1.1:
+            rr = 0
+        elif rtt_ratio < 1.4:
+            rr = 1
+        elif rtt_ratio < 2.0:
+            rr = 2
+        else:
+            rr = 3
 
         # Loss level (0-4)
         if loss_pct < 0.1:
@@ -151,7 +192,7 @@ class RLAgent:
         else:
             l = 4
 
-        return (t, r, l)
+        return (t, g, rr, l)
 
     # -----------------------------------------------------------------------
     # Q-table access
@@ -172,9 +213,11 @@ class RLAgent:
         self.Q[state][action] = max(-10.0, min(10.0, value))
 
     def _best_action(self, state: tuple) -> int:
-        """Return the action with the highest Q-value for this state."""
+        """Return a random action among the highest-Q actions for this state."""
         self._init_state(state)
-        return max(self.Q[state], key=self.Q[state].__getitem__)
+        max_q = max(self.Q[state].values())
+        candidates = [a for a, q in self.Q[state].items() if q == max_q]
+        return random.choice(candidates)
 
     def _max_q(self, state: tuple) -> float:
         self._init_state(state)
@@ -240,65 +283,41 @@ class RLAgent:
     # Reward function
     # -----------------------------------------------------------------------
 
+    def _utility(self, throughput_mbps: float, loss_pct: float, num_streams: int) -> float:
+        """
+        Paper-style utility:
+            U(n, T, L) = T/(K*n) - T*L*B
+        where L is loss ratio in [0, 1].
+        """
+        n = max(1, int(num_streams))
+        l = max(0.0, min(1.0, float(loss_pct) / 100.0))
+        t = max(0.0, float(throughput_mbps))
+        return (t / (self.utility_k * n)) - (t * l * self.utility_b)
+
     def _compute_reward(
         self,
         prev_throughput: float,
+        prev_loss_pct: float,
+        prev_num_streams: int,
         curr_throughput: float,
         curr_loss_pct: float,
-        curr_rtt_ms: float,
-        num_streams: int,
+        curr_num_streams: int,
     ) -> float:
         """
-        Reward function based on the paper's utility:
-            U(n, T, L) = T/Kn  −  T*L*B
-
-        We use the delta form: reward = U_t − U_{t-1}
-
-        Components:
-          + throughput improvement
-          − packet loss penalty   (quadratic, matches paper's non-linear form)
-          − RTT penalty           (congestion onset signal)
-          − stream overhead       (progressive cost for unnecessary streams)
-          + stability bonus       (reward holding a good operating point)
+        Reward from utility delta with an epsilon deadband:
+          +reward_positive if ΔU > +epsilon
+          -reward_negative if ΔU < -epsilon
+          0 otherwise
         """
-        # Throughput improvement (primary signal from the paper)
-        tput_delta = curr_throughput - prev_throughput
+        prev_u = self._utility(prev_throughput, prev_loss_pct, prev_num_streams)
+        curr_u = self._utility(curr_throughput, curr_loss_pct, curr_num_streams)
+        delta_u = curr_u - prev_u
 
-        # Quadratic loss penalty (paper: T*L*B term)
-        loss_penalty = (curr_loss_pct ** 2) * 0.5
-
-        # RTT penalty — high RTT signals the network is filling up
-        rtt_penalty = max(0.0, (curr_rtt_ms - 50.0) * 0.01)
-
-        # Progressive stream overhead penalty (paper: T/Kn term — cost of n)
-        if num_streams <= 4:
-            stream_penalty = 0.0
-        elif num_streams <= 8:
-            stream_penalty = (num_streams - 4) * 0.05
-        elif num_streams <= 12:
-            stream_penalty = 0.2 + (num_streams - 8) * 0.1
-        else:
-            stream_penalty = 0.6 + (num_streams - 12) * 0.3
-
-        # Stability bonus: reward holding a good operating point
-        stability_bonus = (
-            0.3
-            if abs(tput_delta) < 5.0
-            and curr_throughput > 50.0
-            and curr_loss_pct < 0.5
-            else 0.0
-        )
-
-        reward = (
-            tput_delta * 0.1      # scale down so it doesn't dominate
-            + stability_bonus
-            - loss_penalty
-            - rtt_penalty
-            - stream_penalty
-        )
-
-        # Clip for training stability
-        return max(-5.0, min(5.0, reward))
+        if delta_u > self.reward_epsilon:
+            return self.reward_positive
+        if delta_u < -self.reward_epsilon:
+            return -self.reward_negative
+        return 0.0
 
     # -----------------------------------------------------------------------
     # Q-table update (Bellman equation)
@@ -379,7 +398,6 @@ class RLAgent:
             "state": state,
         }
 
-        changed = new_connections != self.current_connections
         self.current_connections = new_connections
         self._last_decision_time = time.monotonic()
         self.total_decisions += 1
@@ -428,10 +446,11 @@ class RLAgent:
         prev = self._last_metrics
         reward = self._compute_reward(
             prev_throughput=prev["throughput"],
+            prev_loss_pct=prev["loss"],
+            prev_num_streams=prev["connections"],
             curr_throughput=throughput_mbps,
             curr_loss_pct=loss_pct,
-            curr_rtt_ms=rtt_ms,
-            num_streams=self.current_connections,
+            curr_num_streams=self.current_connections,
         )
 
         next_state = self.discretize_state(throughput_mbps, rtt_ms, loss_pct)
@@ -441,8 +460,10 @@ class RLAgent:
         self._total_reward += reward
         if reward > 0:
             self._positive_rewards += 1
-        else:
+        elif reward < 0:
             self._negative_rewards += 1
+        else:
+            self._neutral_rewards += 1
         if throughput_mbps > prev["throughput"]:
             self._throughput_improvements += 1
 
@@ -478,7 +499,13 @@ class RLAgent:
             "total_reward": round(self._total_reward, 4),
             "positive_rewards": self._positive_rewards,
             "negative_rewards": self._negative_rewards,
+            "neutral_rewards": self._neutral_rewards,
             "throughput_improvements": self._throughput_improvements,
+            "utility_k": self.utility_k,
+            "utility_b": self.utility_b,
+            "reward_positive": self.reward_positive,
+            "reward_negative": self.reward_negative,
+            "reward_epsilon": self.reward_epsilon,
             "monitoring_interval": self.monitoring_interval,
         }
 
@@ -495,6 +522,8 @@ class RLAgent:
         self._total_reward = 0.0
         self._positive_rewards = 0
         self._negative_rewards = 0
+        self._neutral_rewards = 0
         self._throughput_improvements = 0
+        self._min_rtt_ms = None
         self.exploration_rate = self.exploration_rate  # keep current decay point
         logger.info("RLAgent reset: Q-table cleared")
