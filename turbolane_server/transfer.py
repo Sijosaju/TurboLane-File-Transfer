@@ -19,6 +19,7 @@ No TurboLane code lives here. No engine imports. Pure transfer logic.
 import os
 import math
 import socket
+import select
 import threading
 import time
 import logging
@@ -319,11 +320,6 @@ class StreamWorker:
         inflight: dict[int, dict] = {}
 
         try:
-            self._sock.settimeout(ACK_POLL_TIMEOUT)
-        except OSError:
-            pass
-
-        try:
             with open(self._cq.file_path, "rb") as fh:
                 while not self._stop_event.is_set() and not self._cq.is_done:
                     self._maybe_ping()
@@ -395,6 +391,18 @@ class StreamWorker:
 
     def _drain_frames(self, inflight: dict[int, dict]) -> None:
         for _ in range(PIPELINE_WINDOW * 2):
+            # Poll readability with a short interval so this loop stays
+            # responsive without applying that short timeout to sendall().
+            try:
+                ready, _, _ = select.select([self._sock], [], [], ACK_POLL_TIMEOUT)
+            except (OSError, ValueError) as exc:
+                logger.error("Stream %d: socket poll error: %s", self.stream_id, exc)
+                self._stop_event.set()
+                return
+
+            if not ready:
+                return
+
             try:
                 hdr, _payload = recv_frame(self._sock)
             except socket.timeout:

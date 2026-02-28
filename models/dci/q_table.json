@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
-  "saved_at": 1772256426.9868314,
-  "saved_at_human": "2026-02-28 05:27:06 UTC",
+  "saved_at": 1772262619.2715006,
+  "saved_at_human": "2026-02-28 07:10:19 UTC",
   "q_table": {
     "(3, 0, 0)": {
       "0": -0.908785667504518,
@@ -118,7 +118,7 @@
     "(4, 2, 0)": {
       "0": -0.7500000000000001,
       "1": -0.7500000000000001,
-      "2": 0.0,
+      "2": 0.4066619400000009,
       "3": 0.0,
       "4": 0.0
     },
@@ -138,7 +138,7 @@
     },
     "(4, 1, 0)": {
       "0": -0.7500000000000001,
-      "1": 2.6051519538750005,
+      "1": 3.9286874734009887,
       "2": 0.0,
       "3": 0.0,
       "4": 0.0
@@ -160,15 +160,15 @@
   },
   "stats": {
     "q_table_states": 22,
-    "current_connections": 10,
+    "current_connections": 9,
     "exploration_rate": 0.05,
-    "total_decisions": 774,
-    "total_updates": 756,
-    "average_reward": 0.0066,
-    "total_reward": 5.0,
-    "positive_rewards": 1,
+    "total_decisions": 781,
+    "total_updates": 761,
+    "average_reward": 0.0131,
+    "total_reward": 10.0,
+    "positive_rewards": 2,
     "negative_rewards": 0,
-    "throughput_improvements": 1,
+    "throughput_improvements": 2,
     "monitoring_interval": 5.0
   }
 }
