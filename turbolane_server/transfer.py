@@ -222,13 +222,39 @@ class StreamWorker:
                 if hdr["msg_type"] == MessageType.COMPLETE:
                     logger.info("Stream %d: COMPLETE received", self.stream_id)
                 break
-        except OSError as exc:
+        except (OSError, ConnectionError, ValueError) as exc:
             logger.warning("Stream %d: send_transfer_done error: %s", self.stream_id, exc)
         finally:
             try:
                 self._sock.settimeout(prev_timeout)
             except OSError:
                 pass
+
+    def finish_transfer(self) -> None:
+        """
+        Graceful end-of-transfer shutdown for this stream.
+
+        Must run only after the worker loop exits, so no second thread reads
+        from this socket while waiting for COMPLETE.
+        """
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=ACK_TIMEOUT + 2)
+
+        if self._thread and self._thread.is_alive():
+            logger.warning(
+                "Stream %d: worker did not exit before finalize; closing socket",
+                self.stream_id,
+            )
+        else:
+            self.send_transfer_done()
+
+        if self._sock:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        logger.info("Stream %d: stopped", self.stream_id)
 
     def stop(self) -> None:
         """Signal this stream to stop after finishing its current chunk."""
@@ -373,7 +399,7 @@ class StreamWorker:
                 hdr, _payload = recv_frame(self._sock)
             except socket.timeout:
                 return
-            except (ConnectionError, OSError) as exc:
+            except (ConnectionError, OSError, ValueError) as exc:
                 logger.error("Stream %d: socket error: %s", self.stream_id, exc)
                 self._stop_event.set()
                 return
@@ -570,6 +596,9 @@ class TransferSession:
 
         Safely adds or removes workers without interrupting active transfers.
         """
+        if self._done_event.is_set() or self._chunk_queue.is_done:
+            return
+
         with self._lock:
             current = len(self._workers)
             self._target_streams = new_count
@@ -631,6 +660,9 @@ class TransferSession:
     # ------------------------------------------------------------------
 
     def _spawn_stream(self) -> None:
+        if self._done_event.is_set() or self._chunk_queue.is_done:
+            return
+
         # FIX #3: Always use a fresh, never-reused stream ID.
         with self._lock:
             stream_id = self._next_stream_id
@@ -667,6 +699,19 @@ class TransferSession:
                 daemon=True,
                 name=f"stream-stop-{stream_id}",
             ).start()
+            self.metrics.unregister_stream(stream_id)
+
+    def _finalize_stream(self, stream_id: int) -> None:
+        """
+        Stop and finalize one stream synchronously.
+
+        Used at transfer completion so send_transfer_done() never races with the
+        worker thread recv loop.
+        """
+        with self._lock:
+            worker = self._workers.pop(stream_id, None)
+        if worker:
+            worker.finish_transfer()
             self.metrics.unregister_stream(stream_id)
 
     # ------------------------------------------------------------------
@@ -724,11 +769,7 @@ class TransferSession:
                     ids = list(self._workers.keys())
 
                 for sid in ids:
-                    with self._lock:
-                        worker = self._workers.get(sid)
-                    if worker:
-                        worker.send_transfer_done()   # ← graceful protocol close
-                    self._stop_stream(sid)
+                    self._finalize_stream(sid)
 
                 self.metrics.unregister_all()
                 self._done_event.set()
