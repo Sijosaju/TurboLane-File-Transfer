@@ -71,6 +71,8 @@ class FederatedPolicy:
             auto_save_every:     Persist Q-table every N updates (0 = off)
         """
         self._auto_save_every = auto_save_every
+        self._min_connections = min_connections
+        self._max_connections = max_connections
 
         # --- Storage (owns the file paths) ---
         self._storage = QTableStorage(model_dir=model_dir)
@@ -86,6 +88,9 @@ class FederatedPolicy:
             exploration_decay=exploration_decay,
             min_exploration=min_exploration,
             monitoring_interval=monitoring_interval,
+            discretize_fn=self._discretize_state,
+            reward_fn=self._compute_reward,
+            constraint_fn=self._apply_constraints,
         )
 
         # Load any previously saved Q-table
@@ -187,6 +192,108 @@ class FederatedPolicy:
         Avoid accessing this from application code.
         """
         return self._agent
+
+    # -----------------------------------------------------------------------
+    # DCI policy hooks injected into RLAgent
+    # -----------------------------------------------------------------------
+
+    def _discretize_state(
+        self,
+        throughput_mbps: float,
+        rtt_ms: float,
+        loss_pct: float,
+    ) -> tuple:
+        # Throughput level (0-4)
+        if throughput_mbps < 10:
+            t = 0
+        elif throughput_mbps < 50:
+            t = 1
+        elif throughput_mbps < 100:
+            t = 2
+        elif throughput_mbps < 500:
+            t = 3
+        else:
+            t = 4
+
+        # RTT level (0-3)
+        if rtt_ms < 30:
+            r = 0
+        elif rtt_ms < 80:
+            r = 1
+        elif rtt_ms < 150:
+            r = 2
+        else:
+            r = 3
+
+        # Loss level (0-4)
+        if loss_pct < 0.1:
+            l = 0
+        elif loss_pct < 0.5:
+            l = 1
+        elif loss_pct < 1.0:
+            l = 2
+        elif loss_pct < 2.0:
+            l = 3
+        else:
+            l = 4
+
+        return (t, r, l)
+
+    def _compute_reward(
+        self,
+        prev_throughput: float,
+        curr_throughput: float,
+        curr_loss_pct: float,
+        curr_rtt_ms: float,
+        num_streams: int,
+    ) -> float:
+        # Throughput improvement (primary signal from the paper)
+        tput_delta = curr_throughput - prev_throughput
+
+        # Quadratic loss penalty (paper: T*L*B term)
+        loss_penalty = (curr_loss_pct ** 2) * 0.5
+
+        # RTT penalty — high RTT signals the network is filling up
+        rtt_penalty = max(0.0, (curr_rtt_ms - 50.0) * 0.01)
+
+        # Progressive stream overhead penalty (paper: T/Kn term — cost of n)
+        if num_streams <= 4:
+            stream_penalty = 0.0
+        elif num_streams <= 8:
+            stream_penalty = (num_streams - 4) * 0.05
+        elif num_streams <= 12:
+            stream_penalty = 0.2 + (num_streams - 8) * 0.1
+        else:
+            stream_penalty = 0.6 + (num_streams - 12) * 0.3
+
+        # Stability bonus: reward holding a good operating point
+        stability_bonus = (
+            0.3
+            if abs(tput_delta) < 5.0
+            and curr_throughput > 50.0
+            and curr_loss_pct < 0.5
+            else 0.0
+        )
+
+        reward = (
+            tput_delta * 0.1      # scale down so it doesn't dominate
+            + stability_bonus
+            - loss_penalty
+            - rtt_penalty
+            - stream_penalty
+        )
+
+        # Clip for training stability
+        return max(-5.0, min(5.0, reward))
+
+    def _apply_constraints(
+        self,
+        proposed_connections: int,
+        current_connections: int,
+        recent_metrics: list,
+    ) -> int:
+        del current_connections, recent_metrics
+        return max(self._min_connections, min(self._max_connections, proposed_connections))
 
     # -----------------------------------------------------------------------
     # Internal

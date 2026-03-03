@@ -1,0 +1,16 @@
+{
+  "transfer_id": "xfer-1772542306",
+  "file_name": "test_3gb.bin",
+  "file_size": 3221225472,
+  "total_chunks": 3072,
+  "acked_chunks": 3072,
+  "progress_pct": 100.0,
+  "elapsed_s": 212.56,
+  "throughput_mbps": 121.23,
+  "active_streams": 0,
+  "completed": true,
+  "error": null,
+  "success": true,
+  "fixed_streams": 4,
+  "wall_time_s": 212.881
+}

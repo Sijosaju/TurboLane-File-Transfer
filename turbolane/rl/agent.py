@@ -14,6 +14,7 @@ import random
 import time
 import logging
 from collections import deque
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,9 @@ class RLAgent:
         exploration_decay: float = 0.995,
         min_exploration: float = 0.05,
         monitoring_interval: float = 5.0,
+        discretize_fn: Optional[Callable] = None,
+        reward_fn: Optional[Callable] = None,
+        constraint_fn: Optional[Callable] = None,
     ):
         # Connection bounds
         self.min_connections = min_connections
@@ -69,6 +73,11 @@ class RLAgent:
         # Monitoring interval (agent self-gates decisions)
         self.monitoring_interval = monitoring_interval
         self._last_decision_time: float = 0.0
+
+        # Policy hooks (optional). If not provided, use built-in defaults.
+        self._discretize = discretize_fn or self.discretize_state
+        self._reward = reward_fn or self._compute_reward
+        self._constrain = constraint_fn or self._default_constrain
 
         # Q-table: state_tuple → {action_int: q_value}
         self.Q: dict[tuple, dict[int, float]] = {}
@@ -233,8 +242,22 @@ class RLAgent:
         Apply action delta to current stream count, clamp to [min, max].
         """
         delta = ACTIONS[action]
-        new = current + delta
-        return max(self.min_connections, min(self.max_connections, new))
+        proposed = current + delta
+        recent = (
+            list(self._metrics_history)[-3:]
+            if len(self._metrics_history) >= 3
+            else []
+        )
+        return self._constrain(proposed, current, recent)
+
+    def _default_constrain(
+        self,
+        proposed_connections: int,
+        current_connections: int,
+        recent_metrics: list,
+    ) -> int:
+        del current_connections, recent_metrics
+        return max(self.min_connections, min(self.max_connections, proposed_connections))
 
     # -----------------------------------------------------------------------
     # Reward function
@@ -364,7 +387,7 @@ class RLAgent:
         if not self.should_decide():
             return self.current_connections
 
-        state = self.discretize_state(throughput_mbps, rtt_ms, loss_pct)
+        state = self._discretize(throughput_mbps, rtt_ms, loss_pct)
         action = self.choose_action(state)
         new_connections = self._apply_action(action, self.current_connections)
 
@@ -421,20 +444,20 @@ class RLAgent:
                 "rtt": rtt_ms,
                 "loss": loss_pct,
                 "connections": self.current_connections,
-                "state": self.discretize_state(throughput_mbps, rtt_ms, loss_pct),
+                "state": self._discretize(throughput_mbps, rtt_ms, loss_pct),
             }
             return
 
         prev = self._last_metrics
-        reward = self._compute_reward(
-            prev_throughput=prev["throughput"],
-            curr_throughput=throughput_mbps,
-            curr_loss_pct=loss_pct,
-            curr_rtt_ms=rtt_ms,
-            num_streams=self.current_connections,
+        reward = self._reward(
+            prev["throughput"],
+            throughput_mbps,
+            loss_pct,
+            rtt_ms,
+            self.current_connections,
         )
 
-        next_state = self.discretize_state(throughput_mbps, rtt_ms, loss_pct)
+        next_state = self._discretize(throughput_mbps, rtt_ms, loss_pct)
         self._update_q(self._last_state, self._last_action, reward, next_state)
 
         # Update reward stats
