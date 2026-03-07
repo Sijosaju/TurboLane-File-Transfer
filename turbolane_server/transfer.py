@@ -3,33 +3,23 @@ turbolane_server/transfer.py
 
 TransferSession — orchestrates a single file transfer on the sender side.
 
-Responsibilities:
-  - Split the file into fixed-size chunks
-  - Assign chunks to N parallel streams (round-robin)
-  - Spawn one worker thread per stream; each worker connects to the receiver
-  - Handle PING→PONG RTT measurement per stream
-  - Receive CHUNK_ACKs and track completion
-  - Expose adjust_streams(n) so the TurboLane adapter can change
-    the parallelism mid-transfer (streams can be added or removed live)
-  - Report progress to the terminal
-
-No TurboLane code lives here. No engine imports. Pure transfer logic.
-
-FIXES APPLIED:
-  BUG 1 — StreamWorker._run(): wrapped entire body in try/except so file-open
-           failures and any other unexpected errors are logged and the stop_event
-           is set instead of dying silently (leaving an open socket the server
-           then waits 120 s on → WinError 10054 / TimeoutError).
-  BUG 2 — TransferSession.adjust_streams(): call _prune_dead_workers() first
-           so len(self._workers) reflects only live workers, preventing the
-           adapter from endlessly spawning replacement streams.
-  BUG 3 — TransferSession._monitor_loop(): call _prune_dead_workers() on every
-           iteration so the dead-worker dict is kept clean and the alive-check
-           at the bottom of the loop is accurate.
-  BUG 4 — TransferSession.start(): count how many initial streams actually
-           connected; abort immediately if zero succeed.
-  BUG 5 — StreamWorker._run() retry loop: check stop_event at the top of each
-           attempt so a stop signal is honoured without burning through retries.
+FIXES IN THIS VERSION:
+  BUG 1 — _run(): entire body wrapped in try/except so file-open failures
+           are logged instead of silently killing the thread.
+  BUG 2 — adjust_streams(): calls _prune_dead_workers() first so the live
+           stream count is accurate and the adapter can't flood new streams.
+  BUG 3 — _monitor_loop(): calls _prune_dead_workers() every iteration.
+  BUG 4 — start(): aborts immediately if zero initial streams connected.
+  BUG 5 — _run() retry loop: honours stop_event at the top of each attempt.
+  BUG A — _run() socket error handler: closes self._sock immediately when a
+           ConnectionError/OSError kills a worker, so the server-side
+           StreamHandler unblocks right away instead of waiting 120 s
+           (STREAM_TIMEOUT) before issuing WinError 10054 on the sender.
+  BUG C — stop(): no longer joins the worker thread (join timeout was
+           ACK_TIMEOUT + 2 = 32 s; removing 5 streams in one adapter tick
+           used to freeze the transfer for up to 160 s). The socket is
+           closed immediately so the thread wakes up from its next
+           recv/send and exits on its own.
 """
 
 import os
@@ -55,53 +45,43 @@ from turbolane_server.metrics import MetricsCollector, StreamMetrics
 
 logger = logging.getLogger(__name__)
 
-# How long a worker waits for an ACK before considering a chunk lost
-ACK_TIMEOUT = 30.0          # seconds
-
-PING_INTERVAL = 4.0         # seconds between RTT probes per stream
-
-CONNECT_TIMEOUT = 20.0      # seconds
-
-MAX_CHUNK_RETRIES = 3       # retransmit attempts before giving up
+ACK_TIMEOUT     = 60.0   # seconds — raised from 30 s; RTT on a loaded Wi-Fi
+                          # LAN can spike to ~30 s so 30 s was too tight.
+PING_INTERVAL   = 4.0    # seconds between RTT probes per stream
+CONNECT_TIMEOUT = 20.0   # seconds
+MAX_CHUNK_RETRIES = 3    # retransmit attempts before giving up
 
 
 class ChunkQueue:
-    """
-    Thread-safe queue of (chunk_idx, file_offset, length) tuples.
-    Workers pull from here; the queue is pre-filled before transfer starts.
-    """
+    """Thread-safe queue of (chunk_idx, file_offset, length) tuples."""
 
     def __init__(self, file_path: str, chunk_size: int = CHUNK_SIZE) -> None:
-        self.file_path  = file_path
-        self.chunk_size = chunk_size
-        self.file_size  = os.path.getsize(file_path)
+        self.file_path    = file_path
+        self.chunk_size   = chunk_size
+        self.file_size    = os.path.getsize(file_path)
         self.total_chunks = math.ceil(self.file_size / chunk_size)
 
-        self._q: queue.Queue = queue.Queue()
+        self._q         = queue.Queue()
         self._completed = threading.Event()
-        self._lock = threading.Lock()
-        self._sent_count = 0
+        self._lock      = threading.Lock()
+        self._sent_count  = 0
         self._acked_count = 0
 
-        # Pre-fill the queue
         for idx in range(self.total_chunks):
             offset = idx * chunk_size
             length = min(chunk_size, self.file_size - offset)
             self._q.put((idx, offset, length))
 
-        # Zero-byte files have no chunks; mark complete immediately.
         if self.total_chunks == 0:
             self._completed.set()
 
     def get(self, timeout: float = 1.0) -> Optional[tuple]:
-        """Pop the next (chunk_idx, offset, length) or None if empty/timed out."""
         try:
             return self._q.get(timeout=timeout)
         except queue.Empty:
             return None
 
     def requeue(self, chunk_idx: int, offset: int, length: int) -> None:
-        """Put a failed chunk back for retry."""
         self._q.put((chunk_idx, offset, length))
 
     def mark_acked(self) -> None:
@@ -128,15 +108,7 @@ class ChunkQueue:
 
 
 class StreamWorker:
-    """
-    One parallel TCP stream connecting sender → receiver.
-
-    Lifecycle:
-        worker = StreamWorker(stream_id, host, port, chunk_queue, metrics_sm)
-        worker.start()
-        ...
-        worker.stop()   # graceful shutdown; unfinished chunks go back to queue
-    """
+    """One parallel TCP stream connecting sender to receiver."""
 
     def __init__(
         self,
@@ -150,19 +122,20 @@ class StreamWorker:
         total_chunks: int,
         file_size: int,
     ) -> None:
-        self.stream_id      = stream_id
-        self.host           = host
-        self.port           = port
-        self._cq            = chunk_queue
-        self._sm            = stream_metrics
-        self._transfer_id   = transfer_id
-        self._file_name     = file_name
-        self._total_chunks  = total_chunks
-        self._file_size     = file_size
+        self.stream_id     = stream_id
+        self.host          = host
+        self.port          = port
+        self._cq           = chunk_queue
+        self._sm           = stream_metrics
+        self._transfer_id  = transfer_id
+        self._file_name    = file_name
+        self._total_chunks = total_chunks
+        self._file_size    = file_size
 
-        self._stop_event    = threading.Event()
+        self._stop_event       = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._sock: Optional[socket.socket] = None
+        self._sock_lock        = threading.Lock()
         self._last_ping_time: float = 0.0
 
     # ------------------------------------------------------------------
@@ -170,23 +143,20 @@ class StreamWorker:
     # ------------------------------------------------------------------
 
     def start(self) -> bool:
-        """
-        Connect to receiver and start the worker thread.
-        Returns True on successful connection, False on failure.
-        """
+        """Connect to receiver and start the worker thread."""
         try:
-            self._sock = socket.create_connection(
+            sock = socket.create_connection(
                 (self.host, self.port), timeout=CONNECT_TIMEOUT
             )
-            self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self._sock.settimeout(ACK_TIMEOUT)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(ACK_TIMEOUT)
+            self._sock = sock
         except OSError as exc:
             logger.error("Stream %d: connect failed: %s", self.stream_id, exc)
             return False
 
-        # Send HELLO on this stream
         if not self._send_hello():
-            self._sock.close()
+            self._close_sock()
             return False
 
         self._stop_event.clear()
@@ -196,25 +166,23 @@ class StreamWorker:
             daemon=True,
         )
         self._thread.start()
-        logger.info("Stream %d: started → %s:%d", self.stream_id, self.host, self.port)
+        logger.info("Stream %d: started -> %s:%d", self.stream_id, self.host, self.port)
         return True
 
     def send_transfer_done(self) -> None:
-        """
-        Send TRANSFER_DONE frame and wait for COMPLETE response before the
-        socket is closed, preventing WinError 10054/10053 on the server side.
-        """
-        if self._sock is None:
+        """Send TRANSFER_DONE and wait for COMPLETE before closing."""
+        with self._sock_lock:
+            sock = self._sock
+        if sock is None:
             return
         try:
-            wire_id = self.stream_id & 0xFFFF
             frame = encode_frame(
                 msg_type=MessageType.TRANSFER_DONE,
-                stream_id=wire_id,
+                stream_id=self.stream_id & 0xFFFF,
             )
-            self._sock.sendall(frame)
+            sock.sendall(frame)
             while True:
-                hdr, _payload = recv_frame(self._sock)
+                hdr, _payload = recv_frame(sock)
                 if hdr["msg_type"] == MessageType.PONG:
                     continue
                 if hdr["msg_type"] == MessageType.COMPLETE:
@@ -224,20 +192,36 @@ class StreamWorker:
             logger.warning("Stream %d: send_transfer_done error: %s", self.stream_id, exc)
 
     def stop(self) -> None:
-        """Signal this stream to stop after finishing its current chunk."""
+        """
+        Signal this stream to stop and close its socket immediately.
+
+        BUG C FIX: removed thread.join(timeout=32s). Closing the socket
+        is enough — the worker thread wakes from its blocked recv/send
+        and exits naturally. Joining was blocking the caller for up to
+        32 s per stream (160 s when removing 5 streams at once).
+        """
         self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=ACK_TIMEOUT + 2)
-        if self._sock:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
-        logger.info("Stream %d: stopped", self.stream_id)
+        self._close_sock()
+        logger.info("Stream %d: stop signalled", self.stream_id)
 
     @property
     def is_alive(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _close_sock(self) -> None:
+        """Thread-safe socket close — safe to call from any thread."""
+        with self._sock_lock:
+            sock = self._sock
+            self._sock = None
+        if sock:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------
     # Internal: HELLO handshake
@@ -278,28 +262,23 @@ class StreamWorker:
 
     def _run(self) -> None:
         """
-        Worker loop:
-          1. Pull a chunk from the queue
-          2. Read it from the file
-          3. Send CHUNK frame
-          4. Wait for CHUNK_ACK (with retries)
-          5. Periodically send PING for RTT measurement
+        Worker loop: pull chunk -> send -> wait for ACK -> repeat.
 
-        BUG 1 FIX: The entire body is wrapped in a broad try/except so that
-        any unexpected error (file open failure, OS error, encoding issue, etc.)
-        is logged with a full traceback instead of silently killing the thread.
-        Previously, if open() raised an exception the thread died with no log
-        and the socket stayed open — the server then waited STREAM_TIMEOUT
-        (120 s) before giving up, producing WinError 10054 / TimeoutError.
+        BUG 1 FIX: entire body in try/except Exception so any unexpected
+        error (e.g. file open failure on Windows with special characters in
+        the path) is logged and the socket is closed cleanly.
+
+        BUG A FIX: on ConnectionError/OSError inside the retry loop,
+        _close_sock() is called immediately so the server's recv_frame()
+        unblocks right away rather than waiting STREAM_TIMEOUT (120 s)
+        and then sending WinError 10054 back to the sender.
         """
         try:
             with open(self._cq.file_path, "rb") as fh:
                 while not self._stop_event.is_set() and not self._cq.is_done:
 
-                    # Periodic RTT ping
                     self._maybe_ping()
 
-                    # Get next chunk
                     item = self._cq.get(timeout=0.5)
                     if item is None:
                         continue
@@ -310,6 +289,13 @@ class StreamWorker:
                     for attempt in range(MAX_CHUNK_RETRIES):
                         # BUG 5 FIX: honour stop signal without burning retries.
                         if self._stop_event.is_set():
+                            break
+
+                        # Get current socket — may have been closed by stop().
+                        with self._sock_lock:
+                            sock = self._sock
+                        if sock is None:
+                            self._stop_event.set()
                             break
 
                         try:
@@ -327,16 +313,15 @@ class StreamWorker:
                             )
 
                             send_start = time.monotonic()
-                            self._sock.sendall(frame)
+                            sock.sendall(frame)
                             self._sm.record_bytes(len(data))
                             self._cq.mark_sent()
 
-                            # Wait for ACK — tolerate interleaved PONG frames
+                            # Wait for ACK — tolerate interleaved PONGs.
                             while True:
-                                hdr, _payload = recv_frame(self._sock)
+                                hdr, _payload = recv_frame(sock)
                                 if hdr["msg_type"] == MessageType.PONG:
                                     self._sm.record_pong()
-                                    logger.debug("Stream %d: PONG received (interleaved)", self.stream_id)
                                     continue
                                 break
 
@@ -362,8 +347,17 @@ class StreamWorker:
                                 self.stream_id, chunk_idx, attempt + 1, MAX_CHUNK_RETRIES,
                             )
                             self._sm.record_nack()
+
                         except (ConnectionError, OSError) as exc:
-                            logger.error("Stream %d: socket error: %s", self.stream_id, exc)
+                            logger.error(
+                                "Stream %d: socket error%s: %s",
+                                self.stream_id,
+                                " during retry" if attempt > 0 else "",
+                                exc,
+                            )
+                            # BUG A FIX: close socket immediately so server
+                            # unblocks now rather than after STREAM_TIMEOUT.
+                            self._close_sock()
                             self._stop_event.set()
                             break
 
@@ -375,12 +369,12 @@ class StreamWorker:
                         self._cq.requeue(chunk_idx, offset, length)
 
         except Exception as exc:
-            # BUG 1 FIX: catch anything that slipped through (file open errors,
-            # unexpected exceptions) and log them properly instead of dying silent.
+            # BUG 1 FIX: catch anything unexpected and log it.
             logger.error(
                 "Stream %d: fatal error in worker thread: %s",
                 self.stream_id, exc, exc_info=True,
             )
+            self._close_sock()
             self._stop_event.set()
 
         logger.info("Stream %d: worker loop exited", self.stream_id)
@@ -394,21 +388,23 @@ class StreamWorker:
         if now - self._last_ping_time < PING_INTERVAL:
             return
         self._last_ping_time = now
+        with self._sock_lock:
+            sock = self._sock
+        if sock is None:
+            return
         try:
             frame = encode_frame(
                 msg_type=MessageType.PING,
                 stream_id=self.stream_id & 0xFFFF,
             )
             self._sm.record_ping_sent()
-            self._sock.sendall(frame)
+            sock.sendall(frame)
         except OSError:
             pass
 
 
 class TransferSession:
-    """
-    Manages the complete lifecycle of one outbound file transfer.
-    """
+    """Manages the complete lifecycle of one outbound file transfer."""
 
     def __init__(
         self,
@@ -419,10 +415,10 @@ class TransferSession:
         metrics_collector: MetricsCollector,
         transfer_id: Optional[str] = None,
     ) -> None:
-        self.file_path       = file_path
-        self.receiver_host   = receiver_host
-        self.receiver_port   = receiver_port
-        self.metrics         = metrics_collector
+        self.file_path     = file_path
+        self.receiver_host = receiver_host
+        self.receiver_port = receiver_port
+        self.metrics       = metrics_collector
 
         self._file_name   = Path(file_path).name
         self._file_size   = os.path.getsize(file_path)
@@ -430,14 +426,12 @@ class TransferSession:
 
         self._chunk_queue = ChunkQueue(file_path)
         self._workers: dict[int, StreamWorker] = {}
-        self._lock = threading.Lock()
+        self._lock        = threading.Lock()
         self._target_streams = num_streams
         self._start_time: Optional[float] = None
-        self._end_time: Optional[float] = None
-        self._done_event = threading.Event()
+        self._end_time:   Optional[float] = None
+        self._done_event  = threading.Event()
         self._error: Optional[str] = None
-
-        # Monotonically increasing stream ID — never reused.
         self._next_stream_id = 0
 
         self._monitor_thread: Optional[threading.Thread] = None
@@ -456,8 +450,7 @@ class TransferSession:
         """
         Spawn initial worker streams and begin transfer.
 
-        BUG 4 FIX: Count how many streams actually connected. If zero succeed,
-        set the error and signal done immediately instead of hanging forever.
+        BUG 4 FIX: abort immediately if zero streams connect.
         """
         self._start_time = time.monotonic()
         started = 0
@@ -484,13 +477,10 @@ class TransferSession:
 
     def adjust_streams(self, new_count: int) -> None:
         """
-        Called by the TurboLane adapter when the engine recommends a different
-        number of parallel streams.
+        Called by the adapter when the RL engine recommends a stream count change.
 
-        BUG 2 FIX: Call _prune_dead_workers() first so len(self._workers)
-        only counts truly live workers. Previously dead workers stayed in the
-        dict permanently, making current always grow, which caused the adapter
-        to spawn an endless flood of replacement streams.
+        BUG 2 FIX: prune dead workers before counting so len(self._workers)
+        only reflects live streams, preventing endless stream spawning.
         """
         if self._done_event.is_set() or self._chunk_queue.is_done:
             return
@@ -504,7 +494,7 @@ class TransferSession:
 
         if new_count > current:
             for _ in range(new_count - current):
-                logger.info("Adapter: adding stream (total → %d)", new_count)
+                logger.info("Adapter: adding stream (total -> %d)", new_count)
                 self._spawn_stream()
 
         elif new_count < current:
@@ -513,7 +503,7 @@ class TransferSession:
                 ids_to_stop = ids_to_stop[:current - new_count]
 
             for sid in ids_to_stop:
-                logger.info("Adapter: removing stream %d (total → %d)", sid, new_count)
+                logger.info("Adapter: removing stream %d (total -> %d)", sid, new_count)
                 self._stop_stream(sid)
 
     def get_stats(self) -> dict:
@@ -522,10 +512,7 @@ class TransferSession:
             if self._start_time else 0.0
         )
         acked, total = self._chunk_queue.progress
-        throughput = (
-            (self._file_size * 8) / (elapsed * 1e6)
-            if elapsed > 0 else 0.0
-        )
+        throughput = (self._file_size * 8) / (elapsed * 1e6) if elapsed > 0 else 0.0
         return {
             "transfer_id":     self._transfer_id,
             "file_name":       self._file_name,
@@ -586,7 +573,6 @@ class TransferSession:
         """Remove workers whose threads have exited from the workers dict."""
         with self._lock:
             dead_ids = [sid for sid, w in self._workers.items() if not w.is_alive]
-
         for sid in dead_ids:
             logger.warning("Pruning dead stream %d", sid)
             self._stop_stream(sid)
@@ -595,11 +581,9 @@ class TransferSession:
         with self._lock:
             worker = self._workers.pop(stream_id, None)
         if worker:
-            threading.Thread(
-                target=worker.stop,
-                daemon=True,
-                name=f"stream-stop-{stream_id}",
-            ).start()
+            # BUG C FIX: worker.stop() no longer blocks on thread join,
+            # so calling it directly here is safe and fast.
+            worker.stop()
             self.metrics.unregister_stream(stream_id)
 
     # ------------------------------------------------------------------
@@ -610,31 +594,27 @@ class TransferSession:
         """
         Watches transfer progress and signals completion.
 
-        BUG 3 FIX: Call _prune_dead_workers() on every iteration so the
-        workers dict stays accurate. Previously dead workers accumulated
-        indefinitely, making the alive-check at the bottom always pass and
-        hiding the "all streams died" failure condition.
+        BUG 3 FIX: prune dead workers every iteration so the dict stays
+        accurate and the "no alive workers" check below is reliable.
         """
         while not self._done_event.is_set():
 
-            # BUG 3 FIX: prune dead workers every cycle.
+            # BUG 3 FIX: prune every cycle.
             self._prune_dead_workers()
 
             acked, total = self._chunk_queue.progress
 
-            # Print progress bar
-            pct = acked / total if total else 0
+            pct     = acked / total if total else 0
             bar_len = 40
-            filled = int(bar_len * pct)
-            bar = "█" * filled + "░" * (bar_len - filled)
+            filled  = int(bar_len * pct)
+            bar     = "█" * filled + "░" * (bar_len - filled)
             elapsed = time.monotonic() - self._start_time
-            mbps = (acked * CHUNK_SIZE * 8) / (elapsed * 1e6) if elapsed > 0 else 0
+            mbps    = (acked * CHUNK_SIZE * 8) / (elapsed * 1e6) if elapsed > 0 else 0
 
             print(
                 f"\r  [{bar}] {pct*100:5.1f}%  {acked}/{total} chunks  "
                 f"{mbps:.1f} Mbps  {self._active_worker_count()} streams  ",
-                end="",
-                flush=True,
+                end="", flush=True,
             )
 
             if self._chunk_queue.wait_complete(timeout=1.0):
@@ -661,7 +641,6 @@ class TransferSession:
                 self._done_event.set()
                 break
 
-            # If no live workers remain and transfer isn't done, we're stuck.
             with self._lock:
                 alive = [w for w in self._workers.values() if w.is_alive]
             if not alive and not self._chunk_queue.is_done:

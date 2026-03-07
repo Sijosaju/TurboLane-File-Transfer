@@ -9,7 +9,7 @@ Frame layout (all fields big-endian):
 ├──────────────┼───────┼───────────────────────────────────────────────────┤
 │ magic        │   4   │ 0x544C414E  ("TLAN") — frame start sentinel       │
 │ msg_type     │   1   │ MessageType enum                                   │
-│ stream_id    │   2   │ Which parallel stream (0-65535)  ← FIX: was 1 byte│
+│ stream_id    │   2   │ Which parallel stream (0-65535)                    │
 │ chunk_idx    │   4   │ This chunk's index within the file                 │
 │ total_chunks │   4   │ Total number of chunks in the transfer             │
 │ seq          │   4   │ Sequence number                                    │
@@ -17,27 +17,28 @@ Frame layout (all fields big-endian):
 │ data_len     │   4   │ Payload length in bytes (0 for control frames)     │
 │ checksum     │   4   │ CRC32 of the payload (0 for control frames)        │
 ├──────────────┼───────┼───────────────────────────────────────────────────┤
-│ TOTAL HEADER │  31   │ (was 30 — stream_id grew by 1 byte)               │
+│ TOTAL HEADER │  35   │                                                   │
 └──────────────┴───────┴───────────────────────────────────────────────────┘
 │ payload      │ data_len bytes │ Raw file chunk bytes                      │
 └──────────────┴────────────────┴───────────────────────────────────────────┘
 
-Message types:
-  HELLO        — client initiates: sends file metadata (name, total_size, num_streams)
-  HELLO_ACK    — server confirms ready
-  CHUNK        — file data frame
-  CHUNK_ACK    — server acknowledges a chunk (used for RTT measurement)
-  PING         — RTT probe
-  PONG         — RTT response
-  TRANSFER_DONE — sender signals all chunks sent
-  COMPLETE     — server signals file fully assembled
-  ERROR        — either side reports an error
-  BUSY         — server rejects because a transfer is active
+Format string breakdown — all big-endian (!):
+  I  = magic        (4 bytes)
+  B  = msg_type     (1 byte)
+  H  = stream_id    (2 bytes)
+  I  = chunk_idx    (4 bytes)
+  I  = total_chunks (4 bytes)
+  I  = seq          (4 bytes)
+  Q  = file_offset  (8 bytes)
+  I  = data_len     (4 bytes)
+  I  = checksum     (4 bytes)
+Total: 4+1+2+4+4+4+8+4+4 = 35 bytes
 """
 
 import struct
 import zlib
 import socket
+import json
 from enum import IntEnum
 
 # ------------------------------------------------------------------
@@ -45,50 +46,42 @@ from enum import IntEnum
 # ------------------------------------------------------------------
 MAGIC = 0x544C414E          # "TLAN"
 
-# FIX (Bug 2): stream_id expanded from 1 byte (B / max 255) to 2 bytes (H /
-# max 65535). The TransferSession uses a monotonically increasing stream ID
-# counter (_next_stream_id) that is never reset. With the old 1-byte field,
-# any transfer that spawned more than 256 streams (common with the RL adapter
-# cycling streams over a long run) would silently alias IDs modulo 256, causing
-# CHUNK_ACKs and PONG frames to be correlated to the wrong stream worker.
-#
-# IMPORTANT: Both the sender and receiver must use this updated protocol.py.
-# The field order changed from:
-#   "!IBBIIIQII"  → magic(I) type(B) stream_id(B) chunk_idx(I) ...
-# to:
-#   "!IBHIIIQII"  → magic(I) type(B) stream_id(H) chunk_idx(I) ...
-# Total header size increases from 30 → 31 bytes.
-# Format breakdown — all big-endian (!):
-#   I  = magic        (4 bytes, unsigned int)
-#   B  = msg_type     (1 byte,  unsigned char)
-#   H  = stream_id    (2 bytes, unsigned short)   ← changed from B (1 byte)
-#   I  = chunk_idx    (4 bytes, unsigned int)
-#   I  = total_chunks (4 bytes, unsigned int)
-#   I  = seq          (4 bytes, unsigned int)
-#   Q  = file_offset  (8 bytes, unsigned long long)
-#   I  = data_len     (4 bytes, unsigned int)
-#   I  = checksum     (4 bytes, unsigned int)
-# Total: 4+1+2+4+4+4+8+4+4 = 35 bytes
 HEADER_FORMAT = "!IBHIIIQII"
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # 35 bytes
+HEADER_SIZE   = struct.calcsize(HEADER_FORMAT)   # 35 bytes
 
-CHUNK_SIZE = 1 * 1024 * 1024   # 1 MB default chunk size
-RECV_BUFFER = 65536             # socket recv buffer
+# BUG B FIX: reduced from 1 MB to 256 KB.
+#
+# With 1 MB chunks and 27+ parallel streams, the sender pushes
+# 27+ MB into the Wi-Fi send buffer simultaneously. This causes
+# severe bufferbloat: measured RTT jumped from ~4 ms to ~30,000 ms
+# (29.8 s), which is right at ACK_TIMEOUT (30 s), triggering a
+# cascade of ACK timeouts, stream deaths, and endless respawning.
+#
+# 256 KB × 32 streams = 8 MB max in-flight — a much more manageable
+# burst size for a typical Wi-Fi LAN (80-300 Mbps).  The total
+# number of chunks increases (×4) but each chunk round-trips ~4× 
+# faster, keeping RTT low and the RL adapter's measurements accurate.
+#
+# IMPORTANT: both sender and receiver must use the same protocol.py.
+# The chunk_size is negotiated in the HELLO frame so an existing
+# transfer is not affected by this change mid-flight.
+CHUNK_SIZE  = 256 * 1024    # 256 KB  (was 1 MB)
+RECV_BUFFER = 65536         # socket recv buffer
 
 
 class MessageType(IntEnum):
-    HELLO        = 0x01
-    HELLO_ACK    = 0x02
-    CHUNK        = 0x03
-    CHUNK_ACK    = 0x04
-    PING         = 0x05
-    PONG         = 0x06
+    HELLO         = 0x01
+    HELLO_ACK     = 0x02
+    CHUNK         = 0x03
+    CHUNK_ACK     = 0x04
+    PING          = 0x05
+    PONG          = 0x06
     TRANSFER_DONE = 0x07
-    COMPLETE     = 0x08
-    ERROR        = 0x09
-    BUSY         = 0x0A
-    STATUS_REQ   = 0x0B
-    STATUS_RESP  = 0x0C
+    COMPLETE      = 0x08
+    ERROR         = 0x09
+    BUSY          = 0x0A
+    STATUS_REQ    = 0x0B
+    STATUS_RESP   = 0x0C
 
 
 # ------------------------------------------------------------------
@@ -104,21 +97,6 @@ def encode_frame(
     file_offset: int = 0,
     payload: bytes = b"",
 ) -> bytes:
-    """
-    Pack a frame into bytes ready to send over a TCP socket.
-
-    Args:
-        msg_type:     MessageType enum value
-        stream_id:    Which parallel stream (0-indexed, up to 65535)
-        chunk_idx:    Chunk index within the file
-        total_chunks: Total chunks in this transfer
-        seq:          Sequence number (for ordering / ACK correlation)
-        file_offset:  Byte offset in the source file
-        payload:      Raw bytes to send (empty for control frames)
-
-    Returns:
-        bytes: header + payload
-    """
     data_len = len(payload)
     checksum = zlib.crc32(payload) & 0xFFFFFFFF if payload else 0
 
@@ -126,7 +104,7 @@ def encode_frame(
         HEADER_FORMAT,
         MAGIC,
         int(msg_type),
-        stream_id & 0xFFFF,   # FIX (Bug 2): mask to 2-byte wire width
+        stream_id & 0xFFFF,
         chunk_idx,
         total_chunks,
         seq,
@@ -138,12 +116,6 @@ def encode_frame(
 
 
 def decode_header(raw: bytes) -> dict:
-    """
-    Unpack a raw 31-byte header into a dict.
-
-    Raises:
-        ValueError: if magic bytes don't match or header is truncated
-    """
     if len(raw) < HEADER_SIZE:
         raise ValueError(f"Header too short: got {len(raw)}, need {HEADER_SIZE}")
 
@@ -166,12 +138,7 @@ def decode_header(raw: bytes) -> dict:
 
 
 def recv_exact(sock: socket.socket, n: int) -> bytes:
-    """
-    Read exactly n bytes from sock.
-
-    Raises:
-        ConnectionError: if the socket closes before n bytes are read
-    """
+    """Read exactly n bytes from sock."""
     buf = bytearray()
     while len(buf) < n:
         chunk = sock.recv(min(n - len(buf), RECV_BUFFER))
@@ -182,16 +149,7 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 def recv_frame(sock: socket.socket) -> tuple[dict, bytes]:
-    """
-    Read one complete frame (header + payload) from sock.
-
-    Returns:
-        (header_dict, payload_bytes)
-
-    Raises:
-        ValueError: bad magic / truncated header
-        ConnectionError: socket closed mid-read
-    """
+    """Read one complete frame (header + payload) from sock."""
     raw_header = recv_exact(sock, HEADER_SIZE)
     hdr = decode_header(raw_header)
 
@@ -209,10 +167,8 @@ def recv_frame(sock: socket.socket) -> tuple[dict, bytes]:
 
 
 # ------------------------------------------------------------------
-# Helper: encode a JSON-like metadata payload as UTF-8
-# (used in HELLO / ERROR / STATUS frames — no heavy deps)
+# Metadata helpers
 # ------------------------------------------------------------------
-import json
 
 def encode_meta(data: dict) -> bytes:
     return json.dumps(data).encode("utf-8")
