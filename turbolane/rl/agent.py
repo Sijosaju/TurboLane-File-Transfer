@@ -4,10 +4,32 @@ turbolane/rl/agent.py
 Q-Learning agent for optimizing parallel TCP stream count.
 
 Design principles:
-- State: discretized (throughput_level, rtt_level, loss_level) tuple
-- Actions: 5 discrete actions mapping to stream count deltas
-- Reward: throughput improvement minus congestion penalties
+- State: discretized (throughput_level, rtt_level, loss_level, stream_level) tuple
+- Actions: 5 discrete actions matching paper's design (±5, ±1, hold)
+- Reward: computed by FederatedPolicy (throughput-first, positive by default)
 - No application code. No sockets. No file I/O. Pure RL logic.
+
+FIXES applied (v2):
+  1. Actions updated to match the paper exactly: ±5 (aggressive), ±1 (conservative), 0.
+     Old actions were ±2 and ±1 which is too slow for the 1-32 stream range.
+     The paper explicitly uses +5 and -5 for fast convergence (40% faster claim).
+
+  2. State is now 4-dimensional: (throughput, rtt, loss, stream_count).
+     Old 3D state caused total collapse to 1-3 states across 10 episodes.
+     Adding stream_count as a dimension multiplies the state space by 5,
+     enabling the agent to distinguish (high_tput, 10_streams) from (high_tput, 25_streams).
+
+  3. Oscillation detection window widened to 6 steps (was 4).
+     With ±5 actions the agent moves faster so oscillation is more visible.
+
+  4. Exploration boost threshold raised to 5 visits (was 3).
+     With 5x more states each state is visited less often — needs more boost.
+
+  5. Q-value clip widened to [-20, 20] (was [-10, 10]).
+     The new reward range is [-3, 3] per step; tighter clips stunted learning.
+
+  6. Adaptive learning rate threshold raised to 0.5 (was 1.0) to catch
+     the smaller reward magnitudes that occur during normal positive operation.
 """
 
 import random
@@ -20,14 +42,16 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Action space: index → stream count delta
-# Matches paper's design: aggressive +, conservative +, hold, conservative -, aggressive -
+# Matches paper's design exactly: ±5 (aggressive), ±1 (conservative), 0 (hold)
+# "The actions include adding five, one, or no TCP streams, and removing
+#  one or five TCP streams." — Section III.A.2
 # ---------------------------------------------------------------------------
 ACTIONS = {
-    0: +2,   # aggressive increase
+    0: +5,   # aggressive increase
     1: +1,   # conservative increase
     2:  0,   # hold
     3: -1,   # conservative decrease
-    4: -2,   # aggressive decrease
+    4: -5,   # aggressive decrease
 }
 NUM_ACTIONS = len(ACTIONS)
 
@@ -46,12 +70,12 @@ class RLAgent:
     def __init__(
         self,
         min_connections: int = 1,
-        max_connections: int = 16,
-        default_connections: int = 4,
-        learning_rate: float = 0.1,
-        discount_factor: float = 0.8,
-        exploration_rate: float = 0.3,
-        exploration_decay: float = 0.995,
+        max_connections: int = 32,
+        default_connections: int = 6,
+        learning_rate: float = 0.15,
+        discount_factor: float = 0.9,
+        exploration_rate: float = 0.4,
+        exploration_decay: float = 0.998,
         min_exploration: float = 0.05,
         monitoring_interval: float = 5.0,
         discretize_fn: Optional[Callable] = None,
@@ -100,14 +124,15 @@ class RLAgent:
         self._throughput_improvements: int = 0
 
         logger.info(
-            "RLAgent init: connections=[%d..%d] default=%d "
-            "lr=%.3f γ=%.2f ε=%.2f interval=%.1fs",
+            "RLAgent v2 init: connections=[%d..%d] default=%d "
+            "lr=%.3f γ=%.2f ε=%.2f interval=%.1fs actions=%s",
             min_connections, max_connections, default_connections,
             learning_rate, discount_factor, exploration_rate, monitoring_interval,
+            {a: ACTIONS[a] for a in ACTIONS},
         )
 
     # -----------------------------------------------------------------------
-    # State representation
+    # State representation (fallback — normally overridden by FederatedPolicy)
     # -----------------------------------------------------------------------
 
     def discretize_state(
@@ -117,50 +142,60 @@ class RLAgent:
         loss_pct: float,
     ) -> tuple:
         """
-        Map continuous metrics to a discrete state tuple.
+        Fallback discretisation (used only if no discretize_fn is provided).
+        FederatedPolicy always injects its own fine-grained version.
 
-        Throughput bins (Mbps): 0-10, 10-50, 50-100, 100-500, 500+
-        RTT bins (ms):          0-30, 30-80, 80-150, 150+
-        Loss bins (%):          0-0.1, 0.1-0.5, 0.5-1.0, 1.0-2.0, 2.0+
-
-        These bins are tuned for research-lab / data-center traffic.
-        Widen or narrow them in config if your link characteristics differ.
+        Throughput bins (Mbps): <50, 50-100, 100-125, 125-150, 150-175, 175+
+        RTT bins (ms):          <100, 100-250, 250-450, 450-600, 600+
+        Loss bins (%):          <0.1, 0.1-0.5, 0.5-1.5, 1.5+
+        Stream bins (count):    <8, 8-14, 14-20, 20-26, 26+
         """
-        # Throughput level (0-4)
-        if throughput_mbps < 10:
+        if throughput_mbps < 50:
             t = 0
-        elif throughput_mbps < 50:
-            t = 1
         elif throughput_mbps < 100:
+            t = 1
+        elif throughput_mbps < 125:
             t = 2
-        elif throughput_mbps < 500:
+        elif throughput_mbps < 150:
             t = 3
-        else:
+        elif throughput_mbps < 175:
             t = 4
-
-        # RTT level (0-3)
-        if rtt_ms < 30:
-            r = 0
-        elif rtt_ms < 80:
-            r = 1
-        elif rtt_ms < 150:
-            r = 2
         else:
-            r = 3
+            t = 5
 
-        # Loss level (0-4)
+        if rtt_ms < 100:
+            r = 0
+        elif rtt_ms < 250:
+            r = 1
+        elif rtt_ms < 450:
+            r = 2
+        elif rtt_ms < 600:
+            r = 3
+        else:
+            r = 4
+
         if loss_pct < 0.1:
             l = 0
         elif loss_pct < 0.5:
             l = 1
-        elif loss_pct < 1.0:
+        elif loss_pct < 1.5:
             l = 2
-        elif loss_pct < 2.0:
-            l = 3
         else:
-            l = 4
+            l = 3
 
-        return (t, r, l)
+        streams = self.current_connections
+        if streams < 8:
+            s = 0
+        elif streams < 14:
+            s = 1
+        elif streams < 20:
+            s = 2
+        elif streams < 26:
+            s = 3
+        else:
+            s = 4
+
+        return (t, r, l, s)
 
     # -----------------------------------------------------------------------
     # Q-table access
@@ -177,8 +212,8 @@ class RLAgent:
 
     def _set_q(self, state: tuple, action: int, value: float) -> None:
         self._init_state(state)
-        # Clip to prevent runaway values
-        self.Q[state][action] = max(-10.0, min(10.0, value))
+        # Widened clip range: reward is [-3, 3] per step, multi-step horizon ~15 steps
+        self.Q[state][action] = max(-20.0, min(20.0, value))
 
     def _best_action(self, state: tuple) -> int:
         """Return the action with the highest Q-value for this state."""
@@ -196,7 +231,7 @@ class RLAgent:
     def choose_action(self, state: tuple) -> int:
         """
         Epsilon-greedy action selection with:
-        - Boosted exploration for underexplored states
+        - Boosted exploration for underexplored states (threshold: 5 visits)
         - Oscillation damping (alternating increase/decrease → hold)
         """
         # Decay exploration rate
@@ -205,14 +240,14 @@ class RLAgent:
             self.exploration_rate * self.exploration_decay,
         )
 
-        # Boost exploration for states seen fewer than 3 times
+        # Boost exploration for states seen fewer than 5 times
         visit_count = sum(
             1 for m in self._metrics_history
             if m.get("state") == state
         )
         effective_epsilon = (
-            min(0.6, self.exploration_rate * 2.0)
-            if visit_count < 3
+            min(0.7, self.exploration_rate * 2.0)
+            if visit_count < 5
             else self.exploration_rate
         )
 
@@ -223,13 +258,16 @@ class RLAgent:
         # Exploit — check for oscillation first
         best = self._best_action(state)
 
-        if len(self._action_history) >= 4:
-            recent = list(self._action_history)[-4:]
+        # Wider oscillation window (6 steps) to catch ±5 swings
+        if len(self._action_history) >= 6:
+            recent = list(self._action_history)[-6:]
             increasing = {0, 1}
             decreasing = {3, 4}
-            oscillating = (
-                recent[0] in increasing and recent[1] in decreasing and
-                recent[2] in increasing and recent[3] in decreasing
+            # Detect alternating increase/decrease pattern
+            oscillating = all(
+                (recent[i] in increasing and recent[i + 1] in decreasing) or
+                (recent[i] in decreasing and recent[i + 1] in increasing)
+                for i in range(len(recent) - 1)
             )
             if oscillating:
                 logger.debug("Oscillation detected — forcing hold action")
@@ -260,7 +298,7 @@ class RLAgent:
         return max(self.min_connections, min(self.max_connections, proposed_connections))
 
     # -----------------------------------------------------------------------
-    # Reward function
+    # Fallback reward function (used only if no reward_fn injected)
     # -----------------------------------------------------------------------
 
     def _compute_reward(
@@ -272,56 +310,13 @@ class RLAgent:
         num_streams: int,
     ) -> float:
         """
-        Reward function based on the paper's utility:
-            U(n, T, L) = T/Kn  −  T*L*B
-
-        We use the delta form: reward = U_t − U_{t-1}
-
-        Components:
-          + throughput improvement
-          − packet loss penalty   (quadratic, matches paper's non-linear form)
-          − RTT penalty           (congestion onset signal)
-          − stream overhead       (progressive cost for unnecessary streams)
-          + stability bonus       (reward holding a good operating point)
+        Fallback reward: simple throughput delta minus loss penalty.
+        FederatedPolicy always injects the full reward function instead.
         """
-        # Throughput improvement (primary signal from the paper)
         tput_delta = curr_throughput - prev_throughput
-
-        # Quadratic loss penalty (paper: T*L*B term)
-        loss_penalty = (curr_loss_pct ** 2) * 0.5
-
-        # RTT penalty — high RTT signals the network is filling up
-        rtt_penalty = max(0.0, (curr_rtt_ms - 50.0) * 0.01)
-
-        # Progressive stream overhead penalty (paper: T/Kn term — cost of n)
-        if num_streams <= 4:
-            stream_penalty = 0.0
-        elif num_streams <= 8:
-            stream_penalty = (num_streams - 4) * 0.05
-        elif num_streams <= 12:
-            stream_penalty = 0.2 + (num_streams - 8) * 0.1
-        else:
-            stream_penalty = 0.6 + (num_streams - 12) * 0.3
-
-        # Stability bonus: reward holding a good operating point
-        stability_bonus = (
-            0.3
-            if abs(tput_delta) < 5.0
-            and curr_throughput > 50.0
-            and curr_loss_pct < 0.5
-            else 0.0
-        )
-
-        reward = (
-            tput_delta * 0.1      # scale down so it doesn't dominate
-            + stability_bonus
-            - loss_penalty
-            - rtt_penalty
-            - stream_penalty
-        )
-
-        # Clip for training stability
-        return max(-5.0, min(5.0, reward))
+        loss_penalty = curr_loss_pct ** 2 * 0.5
+        reward = tput_delta * 0.05 - loss_penalty
+        return max(-3.0, min(3.0, reward))
 
     # -----------------------------------------------------------------------
     # Q-table update (Bellman equation)
@@ -340,10 +335,11 @@ class RLAgent:
         td_target = reward + self.discount_factor * max_next_q
         td_error = td_target - current_q
 
-        # Adaptive learning rate: learn faster from significant events
+        # Adaptive learning rate: learn faster from moderate events
+        # Threshold lowered to 0.5 (from 1.0) to catch normal positive rewards
         effective_lr = (
             self.learning_rate * 1.5
-            if abs(reward) > 1.0
+            if abs(reward) > 0.5
             else self.learning_rate
         )
 
@@ -352,8 +348,8 @@ class RLAgent:
         self.total_updates += 1
 
         logger.debug(
-            "Q-update s=%s a=%d r=%.3f td_err=%.3f new_q=%.3f",
-            state, action, reward, td_error, new_q,
+            "Q-update s=%s a=%d(%+d) r=%.3f td_err=%.3f new_q=%.3f",
+            state, action, ACTIONS[action], reward, td_error, new_q,
         )
 
     # -----------------------------------------------------------------------
@@ -402,7 +398,6 @@ class RLAgent:
             "state": state,
         }
 
-        changed = new_connections != self.current_connections
         self.current_connections = new_connections
         self._last_decision_time = time.monotonic()
         self.total_decisions += 1
@@ -519,5 +514,4 @@ class RLAgent:
         self._positive_rewards = 0
         self._negative_rewards = 0
         self._throughput_improvements = 0
-        self.exploration_rate = self.exploration_rate  # keep current decay point
         logger.info("RLAgent reset: Q-table cleared")
