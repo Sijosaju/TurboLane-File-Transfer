@@ -44,8 +44,17 @@ from turbolane_server.protocol import (
 
 logger = logging.getLogger(__name__)
 
-# How long to wait for the next frame before timing out a stream
-STREAM_TIMEOUT = 120.0
+# How long to wait for the next frame before timing out a stream.
+# 120s was way too long — when the sender's RL adapter removes a stream
+# (closes the socket), the server-side handler was blocked in recv_frame()
+# for up to 120s before timing out, flooding logs with TimeoutError.
+# On a LAN a healthy stream should receive a chunk within a few seconds.
+STREAM_TIMEOUT = 30.0
+
+# How long to wait for the FIRST frame (HELLO) after a connection is accepted.
+# Newly spawned streams that get removed by the adapter before sending HELLO
+# would otherwise hold the timeout for the full STREAM_TIMEOUT.
+HELLO_TIMEOUT = 10.0
 
 # Directory where received files are saved (overridden by CLI)
 DEFAULT_OUTPUT_DIR = "./received"
@@ -194,10 +203,21 @@ class StreamHandler:
         try:
             # LAN optimization: increase receive buffer to 4 MB
             self._conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-            self._conn.settimeout(STREAM_TIMEOUT)
+            # Use a short timeout waiting for HELLO — streams removed by the RL
+            # adapter before they send HELLO would otherwise hold for STREAM_TIMEOUT.
+            self._conn.settimeout(HELLO_TIMEOUT)
             self._run()
         except ConnectionError as exc:
             logger.info("Stream %d closed: %s", self._stream_id, exc)
+        except TimeoutError:
+            # A timeout on a stream that never sent HELLO is normal — the sender's
+            # RL adapter opened the connection then immediately closed it.
+            # A timeout mid-transfer means the sender removed this stream.
+            # Both are expected behaviour, not errors.
+            if self._stream_id == -1:
+                logger.debug("Stream closed before HELLO (adapter removed it)")
+            else:
+                logger.info("Stream %d timed out (sender closed or removed)", self._stream_id)
         except Exception as exc:
             logger.error("Stream %d error: %s", self._stream_id, exc, exc_info=True)
         finally:
@@ -213,6 +233,9 @@ class StreamHandler:
 
             if msg == MessageType.HELLO:
                 self._handle_hello(hdr, payload)
+                # Switch to longer timeout now that the stream is active —
+                # HELLO_TIMEOUT was just to catch streams that never start.
+                self._conn.settimeout(STREAM_TIMEOUT)
 
             elif msg == MessageType.CHUNK:
                 self._handle_chunk(hdr, payload)
