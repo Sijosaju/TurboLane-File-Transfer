@@ -317,14 +317,32 @@ class StreamWorker:
 
                             send_start = time.monotonic()
                             sock.sendall(frame)
-                            self._sm.record_bytes(len(data))
-                            self._cq.mark_sent()
+                            # Only count bytes/sent on first attempt to avoid
+                            # inflating throughput and loss metrics on retries
+                            if attempt == 0:
+                                self._sm.record_bytes(len(data))
+                                self._cq.mark_sent()
 
-                            # Wait for ACK — tolerate interleaved PONGs.
+                            # Wait for ACK — tolerate interleaved PONGs and
+                            # drain stale CHUNK_ACKs for previous chunks.
+                            # Stale ACKs arrive when a chunk was retransmitted
+                            # and the original delayed ACK finally shows up.
+                            # Treating them as errors caused spurious retries
+                            # that compounded RTT and tanked throughput.
                             while True:
                                 hdr, _payload = recv_frame(sock)
                                 if hdr["msg_type"] == MessageType.PONG:
                                     self._sm.record_pong()
+                                    continue
+                                if (
+                                    hdr["msg_type"] == MessageType.CHUNK_ACK
+                                    and hdr["chunk_idx"] != chunk_idx
+                                ):
+                                    # Stale ACK for an already-completed chunk — discard silently
+                                    logger.debug(
+                                        "Stream %d chunk %d: discarding stale ACK for chunk %d",
+                                        self.stream_id, chunk_idx, hdr["chunk_idx"],
+                                    )
                                     continue
                                 break
 
@@ -339,7 +357,7 @@ class StreamWorker:
                                 break
                             else:
                                 logger.warning(
-                                    "Stream %d chunk %d: unexpected response %s (attempt %d)",
+                                    "Stream %d chunk %d: unexpected response type %s (attempt %d)",
                                     self.stream_id, chunk_idx, hdr["msg_type"], attempt + 1,
                                 )
                                 self._sm.record_nack()
