@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
-  "saved_at": 1772955142.2631283,
-  "saved_at_human": "2026-03-08 07:32:22 UTC",
+  "saved_at": 1772955175.9399354,
+  "saved_at_human": "2026-03-08 07:32:55 UTC",
   "q_table": {
     "(2, 2, 0, 0)": {
       "0": 0.3788522893254153,
@@ -69,7 +69,7 @@
     "(3, 4, 0, 3)": {
       "0": 0.0,
       "1": 0.0,
-      "2": 0.2732254626044701,
+      "2": 0.5379600901633461,
       "3": 0.0,
       "4": 0.0
     },
@@ -81,7 +81,7 @@
       "4": 0.0
     },
     "(3, 4, 0, 4)": {
-      "0": 0.8681128164460228,
+      "0": 0.9401052456934222,
       "1": 0.0,
       "2": 0.0,
       "3": 0.0,
@@ -92,7 +92,7 @@
       "1": 0.0,
       "2": 0.0,
       "3": 0.0,
-      "4": 0.8621094806179848
+      "4": 0.38657102261359894
     },
     "(0, 4, 0, 3)": {
       "0": 0.10116661690938987,
@@ -135,19 +135,26 @@
       "2": 0.0,
       "3": 0.0,
       "4": 0.0
+    },
+    "(4, 4, 0, 3)": {
+      "0": 0.30612559745097817,
+      "1": 0.0,
+      "2": 0.0,
+      "3": 0.0,
+      "4": 0.0
     }
   },
   "stats": {
-    "q_table_states": 19,
-    "current_connections": 23,
-    "exploration_rate": 0.121,
-    "total_decisions": 50,
-    "total_updates": 50,
-    "average_reward": 0.4957,
-    "total_reward": 24.7871,
-    "positive_rewards": 44,
-    "negative_rewards": 6,
-    "throughput_improvements": 25,
+    "q_table_states": 20,
+    "current_connections": 32,
+    "exploration_rate": 0.1151,
+    "total_decisions": 55,
+    "total_updates": 54,
+    "average_reward": 0.4714,
+    "total_reward": 25.4566,
+    "positive_rewards": 47,
+    "negative_rewards": 7,
+    "throughput_improvements": 26,
     "monitoring_interval": 2.0
   }
 }

@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
-  "saved_at": 1772955175.9399354,
-  "saved_at_human": "2026-03-08 07:32:55 UTC",
+  "saved_at": 1773058535.9714499,
+  "saved_at_human": "2026-03-09 12:15:35 UTC",
   "q_table": {
     "(2, 2, 0, 0)": {
       "0": 0.3788522893254153,
@@ -146,7 +146,7 @@
   },
   "stats": {
     "q_table_states": 20,
-    "current_connections": 32,
+    "current_connections": 16,
     "exploration_rate": 0.1151,
     "total_decisions": 55,
     "total_updates": 54,
@@ -155,6 +155,6 @@
     "positive_rewards": 47,
     "negative_rewards": 7,
     "throughput_improvements": 26,
-    "monitoring_interval": 2.0
+    "monitoring_interval": 5.0
   }
 }

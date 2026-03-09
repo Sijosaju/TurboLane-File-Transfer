@@ -218,8 +218,16 @@ class StreamWorker:
         self._stop_event    = threading.Event()
         self._fatal_event   = threading.Event()   # socket-level fatal error
 
-        self._sock: Optional[socket.socket] = None
-        self._sock_lock     = threading.Lock()
+        # Two socket references to the SAME underlying connection.
+        # _sock_tx  — used exclusively by the sender thread (blocking, no timeout
+        #             so sendall() on large 512 KB frames never times out mid-write)
+        # _sock_rx  — used exclusively by the receiver thread (1 s timeout so the
+        #             thread wakes periodically to check stop/fatal events without
+        #             a dedicated timer thread)
+        # Both are closed together in _close_sock().
+        self._sock_tx: Optional[socket.socket] = None   # sender thread only
+        self._sock_rx: Optional[socket.socket] = None   # receiver thread only
+        self._sock_lock     = threading.Lock()           # guards _close_sock()
 
         # Sliding window state
         # chunk_idx → _InFlightEntry
@@ -251,12 +259,18 @@ class StreamWorker:
             # LAN optimization: 4 MB kernel buffers per stream
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-            # No monolithic socket timeout — the pipeline manages its own
-            # per-chunk deadlines via CHUNK_ACK_TIMEOUT.  We use a short
-            # recv timeout only so the receiver thread can wake up and check
-            # _stop_event / _fatal_event periodically.
-            sock.settimeout(1.0)
-            self._sock = sock
+
+            # _sock_tx: fully blocking — sendall() on a 512 KB chunk must never
+            # time out mid-write on a slow/congested Wi-Fi link.
+            sock.setblocking(True)
+            self._sock_tx = sock
+
+            # _sock_rx: duplicate fd so the receiver thread can set a short
+            # recv timeout without affecting the sender's writes at all.
+            sock_rx = sock.dup()
+            sock_rx.settimeout(1.0)
+            self._sock_rx = sock_rx
+
         except OSError as exc:
             logger.error("Stream %d: connect failed: %s", self.stream_id, exc)
             return False
@@ -290,28 +304,64 @@ class StreamWorker:
         return True
 
     def send_transfer_done(self) -> None:
-        """Send TRANSFER_DONE and wait for COMPLETE (called after all chunks ACKed)."""
-        with self._sock_lock:
-            sock = self._sock
-        if sock is None:
-            return
+        """
+        Notify the server that this stream's transfer is complete.
+
+        Opens a fresh TCP connection for this handshake because the pipeline
+        sockets (_sock_tx / _sock_rx) are already closed by stop() before
+        this method is called.  A dedicated connection avoids any possibility
+        of concurrent access with the now-exited pipeline threads.
+        """
         try:
-            # Restore a longer timeout for this synchronous handshake
-            sock.settimeout(ACK_TIMEOUT)
-            frame = encode_frame(
-                msg_type=MessageType.TRANSFER_DONE,
-                stream_id=self.stream_id & 0xFFFF,
-            )
-            sock.sendall(frame)
-            while True:
-                hdr, _payload = recv_frame(sock)
-                if hdr["msg_type"] == MessageType.PONG:
-                    continue
-                if hdr["msg_type"] == MessageType.COMPLETE:
-                    logger.info("Stream %d: COMPLETE received", self.stream_id)
-                break
+            with socket.create_connection(
+                (self.host, self.port), timeout=ACK_TIMEOUT
+            ) as sock:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.settimeout(ACK_TIMEOUT)
+
+                # Re-send HELLO so the server knows which transfer/stream this is
+                meta = {
+                    "transfer_id":  self._transfer_id,
+                    "stream_id":    self.stream_id,
+                    "file_name":    self._file_name,
+                    "file_size":    self._file_size,
+                    "total_chunks": self._total_chunks,
+                    "chunk_size":   CHUNK_SIZE,
+                }
+                hello = encode_frame(
+                    msg_type=MessageType.HELLO,
+                    stream_id=self.stream_id & 0xFFFF,
+                    payload=encode_meta(meta),
+                )
+                sock.sendall(hello)
+                hdr, _ = recv_frame(sock)
+                if hdr["msg_type"] not in (MessageType.HELLO_ACK, MessageType.BUSY):
+                    logger.warning(
+                        "Stream %d: unexpected HELLO response during done handshake: %s",
+                        self.stream_id, hdr["msg_type"],
+                    )
+                    return
+
+                # Send TRANSFER_DONE
+                done_frame = encode_frame(
+                    msg_type=MessageType.TRANSFER_DONE,
+                    stream_id=self.stream_id & 0xFFFF,
+                )
+                sock.sendall(done_frame)
+
+                # Wait for COMPLETE
+                while True:
+                    hdr, _ = recv_frame(sock)
+                    if hdr["msg_type"] == MessageType.PONG:
+                        continue
+                    if hdr["msg_type"] == MessageType.COMPLETE:
+                        logger.info("Stream %d: COMPLETE received", self.stream_id)
+                    break
+
         except OSError as exc:
-            logger.warning("Stream %d: send_transfer_done error: %s", self.stream_id, exc)
+            logger.warning(
+                "Stream %d: send_transfer_done error: %s", self.stream_id, exc
+            )
 
     def stop(self) -> None:
         """
@@ -344,13 +394,14 @@ class StreamWorker:
 
     def _close_sock(self) -> None:
         with self._sock_lock:
-            sock = self._sock
-            self._sock = None
-        if sock:
-            try:
-                sock.close()
-            except OSError:
-                pass
+            tx, self._sock_tx = self._sock_tx, None
+            rx, self._sock_rx = self._sock_rx, None
+        for s in (tx, rx):
+            if s:
+                try:
+                    s.close()
+                except OSError:
+                    pass
 
     def _fatal(self) -> None:
         """Mark stream as fatally failed; both threads will see this and exit."""
@@ -383,9 +434,12 @@ class StreamWorker:
             payload=encode_meta(meta),
         )
         try:
-            self._sock.settimeout(CONNECT_TIMEOUT)
-            self._sock.sendall(frame)
-            hdr, payload = recv_frame(self._sock)
+            # HELLO is synchronous and happens before threads start — use tx socket.
+            # It already has a connect-phase timeout from create_connection; set it
+            # explicitly here to cover the HELLO_ACK recv as well.
+            self._sock_tx.settimeout(CONNECT_TIMEOUT)
+            self._sock_tx.sendall(frame)
+            hdr, payload = recv_frame(self._sock_tx)
             if hdr["msg_type"] == MessageType.BUSY:
                 info = decode_meta(payload) if payload else {}
                 logger.error(
@@ -398,6 +452,9 @@ class StreamWorker:
                     self.stream_id, hdr["msg_type"],
                 )
                 return False
+            # Restore fully blocking mode — the sender thread must not hit
+            # a timeout on sendall() when writing large chunks.
+            self._sock_tx.setblocking(True)
             return True
         except Exception as exc:
             logger.error("Stream %d: HELLO failed: %s", self.stream_id, exc)
@@ -474,9 +531,8 @@ class StreamWorker:
                     self._maybe_ping()
 
                     # ── Send the chunk ──────────────────────────────────────
-                    with self._sock_lock:
-                        sock = self._sock
-                    if sock is None:
+                    # _sock_tx is owned exclusively by this thread — no lock needed.
+                    if self._sock_tx is None:
                         self._window_sem.release()
                         self._cq.requeue(chunk_idx, offset, length)
                         break
@@ -496,7 +552,7 @@ class StreamWorker:
                         )
 
                         send_time = time.monotonic()
-                        sock.sendall(frame)
+                        self._sock_tx.sendall(frame)
 
                         # Only record bytes / sent on the first attempt
                         if attempt == 0:
@@ -553,13 +609,12 @@ class StreamWorker:
           anything else → log and ignore
         """
         while not self._stop_event.is_set() and not self._fatal_event.is_set():
-            with self._sock_lock:
-                sock = self._sock
-            if sock is None:
+            # _sock_rx is owned exclusively by this thread — no lock needed.
+            if self._sock_rx is None:
                 break
 
             try:
-                hdr, _payload = recv_frame(sock)
+                hdr, _payload = recv_frame(self._sock_rx)
 
             except socket.timeout:
                 # Short recv timeout (1 s) — just loop and check stop events
@@ -703,9 +758,8 @@ class StreamWorker:
         if now - self._last_ping_time < PING_INTERVAL:
             return
         self._last_ping_time = now
-        with self._sock_lock:
-            sock = self._sock
-        if sock is None:
+        # Called from sender thread — use _sock_tx directly, no lock needed.
+        if self._sock_tx is None:
             return
         try:
             frame = encode_frame(
@@ -713,7 +767,7 @@ class StreamWorker:
                 stream_id=self.stream_id & 0xFFFF,
             )
             self._sm.record_ping_sent()
-            sock.sendall(frame)
+            self._sock_tx.sendall(frame)
         except OSError:
             pass
 
@@ -952,9 +1006,30 @@ class TransferSession:
                     (self._file_size * 8) / ((self._end_time - self._start_time) * 1e6),
                 )
 
+                # Step 1: set _done_event NOW so the RL adapter stops spawning
+                # streams during the shutdown window (it checks this flag in
+                # adjust_streams before doing anything).
+                self._done_event.set()
+
+                # Step 2: stop pipeline threads on all workers first.
+                # send_transfer_done() writes to _sock_tx — we must ensure the
+                # sender thread has exited before we do that, otherwise two
+                # threads write to the same fd simultaneously.
+                # worker.stop() closes sockets and signals threads (no join per
+                # BUG C fix), so it returns immediately.
+                with self._lock:
+                    workers_snapshot = list(self._workers.values())
+                for worker in workers_snapshot:
+                    worker.stop()
+
+                # Brief pause to let threads drain and requeue in-flight chunks.
+                # No join needed — 100 ms is enough for threads to see the stop
+                # signal and exit their current recv/send iteration.
+                time.sleep(0.1)
+
+                # Step 3: TRANSFER_DONE handshake on each stream's now-idle socket.
                 with self._lock:
                     ids = list(self._workers.keys())
-
                 for sid in ids:
                     with self._lock:
                         worker = self._workers.get(sid)
@@ -963,7 +1038,6 @@ class TransferSession:
                     self._stop_stream(sid)
 
                 self.metrics.unregister_all()
-                self._done_event.set()
                 break
 
             with self._lock:
