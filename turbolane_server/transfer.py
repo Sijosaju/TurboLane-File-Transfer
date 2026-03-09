@@ -83,10 +83,13 @@ logger = logging.getLogger(__name__)
 # Raise this if RTT is high; lower it under heavy packet loss.
 PIPELINE_DEPTH = 8
 
-# Per-chunk ACK deadline inside the pipeline.  Much tighter than the old
-# monolithic ACK_TIMEOUT because we now have per-chunk send timestamps.
-# Set to 3× the worst expected RTT your tc-netem experiment will impose.
-CHUNK_ACK_TIMEOUT = 5.0     # seconds
+# Per-chunk ACK deadline inside the pipeline.
+# With 16 streams × 8 in-flight = 128 chunks simultaneously on a shared
+# Wi-Fi link, the server's ACK queue can back up by several seconds even
+# under zero artificial delay.  5 s was far too tight — healthy chunks were
+# being falsely timed out and requeued in an infinite loop.
+# 30 s matches ACK_TIMEOUT and gives the server plenty of headroom.
+CHUNK_ACK_TIMEOUT = 30.0    # seconds
 
 # Legacy socket-level timeout (used only for the HELLO handshake and
 # send_transfer_done, where we still do a synchronous recv).
@@ -102,7 +105,16 @@ MAX_CHUNK_RETRIES = 3       # retransmit attempts before giving up on a chunk
 # ---------------------------------------------------------------------------
 
 class ChunkQueue:
-    """Thread-safe queue of (chunk_idx, file_offset, length) tuples."""
+    """
+    Thread-safe queue of (chunk_idx, file_offset, length) tuples.
+
+    Retry tracking lives here (not in StreamWorker) because a timed-out chunk
+    gets requeued and picked up by a *different* stream.  If each StreamWorker
+    kept its own retry counter, every stream would start the chunk at attempt 0
+    and the MAX_CHUNK_RETRIES limit would never be enforced — causing an
+    infinite retry loop.  Centralising the counter in ChunkQueue means the
+    global attempt count increments correctly regardless of which stream retries.
+    """
 
     def __init__(self, file_path: str, chunk_size: int = CHUNK_SIZE) -> None:
         self.file_path    = file_path
@@ -115,6 +127,10 @@ class ChunkQueue:
         self._lock        = threading.Lock()
         self._sent_count  = 0
         self._acked_count = 0
+
+        # Global retry counter: chunk_idx → number of timeout/requeue events.
+        # Protected by _lock (same lock as _acked_count for simplicity).
+        self._retry_counts: dict[int, int] = {}
 
         for idx in range(self.total_chunks):
             offset = idx * chunk_size
@@ -132,6 +148,23 @@ class ChunkQueue:
 
     def requeue(self, chunk_idx: int, offset: int, length: int) -> None:
         self._q.put((chunk_idx, offset, length))
+
+    def get_retry_count(self, chunk_idx: int) -> int:
+        """Return the current global retry count for this chunk."""
+        with self._lock:
+            return self._retry_counts.get(chunk_idx, 0)
+
+    def increment_retry(self, chunk_idx: int) -> int:
+        """Increment and return the new global retry count for this chunk."""
+        with self._lock:
+            count = self._retry_counts.get(chunk_idx, 0) + 1
+            self._retry_counts[chunk_idx] = count
+            return count
+
+    def clear_retry(self, chunk_idx: int) -> None:
+        """Clear the retry counter after a successful ACK."""
+        with self._lock:
+            self._retry_counts.pop(chunk_idx, None)
 
     def mark_acked(self) -> None:
         with self._lock:
@@ -236,10 +269,6 @@ class StreamWorker:
 
         # Semaphore limits how many chunks the sender thread can have in flight
         self._window_sem = threading.Semaphore(pipeline_depth)
-
-        # Retry counters per chunk: chunk_idx → attempt_number
-        self._retry_counts: dict[int, int] = {}
-        self._retry_lock   = threading.Lock()
 
         self._sender_thread:   Optional[threading.Thread] = None
         self._receiver_thread: Optional[threading.Thread] = None
@@ -511,20 +540,18 @@ class StreamWorker:
 
                     chunk_idx, offset, length = item
 
-                    # ── Get retry count for this chunk ──────────────────────
-                    with self._retry_lock:
-                        attempt = self._retry_counts.get(chunk_idx, 0)
+                    # ── Check global retry count for this chunk ─────────────
+                    # Retry count lives in ChunkQueue so it survives cross-stream
+                    # requeuing — a chunk timed out on stream A and picked up by
+                    # stream B still has its accumulated attempt count.
+                    attempt = self._cq.get_retry_count(chunk_idx)
 
                     if attempt >= MAX_CHUNK_RETRIES:
                         logger.error(
-                            "Stream %d chunk %d: exceeded max retries (%d), dropping",
+                            "Stream %d chunk %d: exceeded max retries (%d) globally — dropping",
                             self.stream_id, chunk_idx, MAX_CHUNK_RETRIES,
                         )
-                        # Release window slot — we're not putting this in-flight
                         self._window_sem.release()
-                        # Still mark it acked so the transfer can complete
-                        # (the receiver side won't see an ACK for this chunk).
-                        # Alternatively surface as an error — for now we log and skip.
                         continue
 
                     # ── Inject PING if due ──────────────────────────────────
@@ -651,10 +678,8 @@ class StreamWorker:
                         "Stream %d ← ACK chunk %d  RTT %.1f ms  in_flight=%d",
                         self.stream_id, acked_idx, rtt_ms, len(self._in_flight),
                     )
-                    # Clear retry counter on success
-                    with self._retry_lock:
-                        self._retry_counts.pop(acked_idx, None)
-
+                    # Clear global retry counter on success
+                    self._cq.clear_retry(acked_idx)
                     self._cq.mark_acked()
                     # Release one window slot so sender can push another chunk
                     self._window_sem.release()
@@ -705,9 +730,9 @@ class StreamWorker:
                 del self._in_flight[idx]
 
         for idx, entry in timed_out:
-            with self._retry_lock:
-                attempt = self._retry_counts.get(idx, 0) + 1
-                self._retry_counts[idx] = attempt
+            # Increment the *global* retry count in ChunkQueue so the new
+            # attempt number is visible to whichever stream picks this up next.
+            attempt = self._cq.increment_retry(idx)
 
             logger.warning(
                 "Stream %d chunk %d: ACK timeout (attempt %d/%d) — requeueing",
@@ -722,7 +747,7 @@ class StreamWorker:
                 self._cq.requeue(idx, entry.offset, entry.length)
             else:
                 logger.error(
-                    "Stream %d chunk %d: max retries reached — chunk lost",
+                    "Stream %d chunk %d: max retries reached globally — chunk lost",
                     self.stream_id, idx,
                 )
 
