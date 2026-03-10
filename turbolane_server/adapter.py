@@ -49,7 +49,7 @@ class TurboLaneAdapter:
         self,
         metrics: MetricsCollector,
         stream_count_callback: Callable[[int], None],
-        interval: float = 2.0,        # reduced from 5.0s — faster adaptation on LAN
+        interval: float = 5.0,
         mode: str = "dci",
         algorithm: str = "qlearning",
         model_dir: str = "models/dci",
@@ -57,9 +57,11 @@ class TurboLaneAdapter:
         max_streams: int = 32,
         default_streams: int = 4,
     ) -> None:
-        self._metrics   = metrics
-        self._callback  = stream_count_callback
-        self._interval  = interval
+        self._metrics      = metrics
+        self._callback     = stream_count_callback
+        self._interval     = interval
+        self._min_streams  = min_streams
+        self._max_streams  = max_streams
 
         # Instantiate the TurboLane engine (decoupled from all app logic)
         self._engine = TurboLaneEngine(
@@ -141,6 +143,13 @@ class TurboLaneAdapter:
         """Single monitoring cycle."""
         snap = self._metrics.snapshot()
         self._last_snapshot = snap
+        active_streams = snap["active_streams"]
+
+        # No active workers yet (or transfer already ended): do not train on
+        # zeroed metrics and do not issue stream-change callbacks.
+        if active_streams <= 0:
+            logger.debug("Adapter tick skipped: no active streams")
+            return
 
         throughput = snap["throughput_mbps"]
         rtt        = snap["rtt_ms"]
@@ -152,9 +161,29 @@ class TurboLaneAdapter:
         # --- Phase 2: decide new stream count ---
         new_streams = self._engine.decide(throughput, rtt, loss)
 
+        # --- Phase 3: congestion guard ---
+        # When the link is overloaded (loss > 5% OR RTT > 500 ms), prevent
+        # the RL model from adding more streams — that would make congestion
+        # worse. Clamp to current count; still allow the engine to reduce.
+        if loss > 5.0 or (rtt > 500.0 and rtt > 0):
+            new_streams = min(new_streams, self._last_decision_streams)
+            new_streams = max(new_streams, self._min_streams)
+            logger.debug(
+                "Congestion guard: holding at %d streams "
+                "(loss=%.2f%% rtt=%.0f ms)",
+                new_streams, loss, rtt,
+            )
+
+        # Keep stream changes gradual to avoid connection churn on Wi-Fi.
+        delta = new_streams - self._last_decision_streams
+        if delta > 2:
+            new_streams = self._last_decision_streams + 2
+        elif delta < -2:
+            new_streams = self._last_decision_streams - 2
+
         if new_streams != self._last_decision_streams:
             logger.info(
-                "TurboLane: streams %d → %d  (tput=%.1f Mbps rtt=%.1f ms loss=%.3f%%)",
+                "TurboLane: streams %d -> %d  (tput=%.1f Mbps rtt=%.1f ms loss=%.3f%%)",
                 self._last_decision_streams, new_streams,
                 throughput, rtt, loss,
             )

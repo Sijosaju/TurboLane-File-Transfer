@@ -49,11 +49,11 @@ class TurboLaneSender:
         file_path: str,
         receiver_host: str,
         receiver_port: int = 9000,
-        initial_streams: int = 16,
-        min_streams: int = 8,
-        max_streams: int = 64,
+        initial_streams: int = 4,
+        min_streams: int = 1,
+        max_streams: int = 32,
         model_dir: str = "models/dci",
-        monitor_interval: float = 2.0,
+        monitor_interval: float = 5.0,
         timeout: Optional[float] = None,
     ) -> None:
         if not os.path.isfile(file_path):
@@ -71,9 +71,10 @@ class TurboLaneSender:
         print(f"  File     : {os.path.abspath(file_path)}")
         print(f"  Size     : {file_size / 1e6:.2f} MB")
         print(f"  Receiver : {receiver_host}:{receiver_port}")
-        print(f"  Streams  : {initial_streams} initial  [{min_streams}..{max_streams}]  (LAN-optimized)")
+        print(f"  Streams  : {initial_streams} initial  [{min_streams}..{max_streams}]")
         print(f"  Model    : {model_dir}")
-        print(f"  RL cycle : every {monitor_interval}s  (fast-adapt mode)\n")
+        rl_label = "fast-adapt" if monitor_interval <= 2.0 else "standard"
+        print(f"  RL cycle : every {monitor_interval}s  ({rl_label} mode)\n")
 
         # --- Metrics (shared between transfer layer and adapter) ---
         self._metrics = MetricsCollector()
@@ -143,12 +144,12 @@ class TurboLaneSender:
         return success
 
     def _print_summary(self, stats: dict, elapsed: float, success: bool) -> None:
-        status = "✓ COMPLETED" if success else "✗ FAILED"
-        error  = f" — {stats['error']}" if stats.get("error") else ""
+        status = "COMPLETED" if success else "FAILED"
+        error  = f" - {stats['error']}" if stats.get("error") else ""
 
-        print(f"\n  {'─'*56}")
+        print(f"\n  {'-'*56}")
         print(f"  Transfer Summary")
-        print(f"  {'─'*56}")
+        print(f"  {'-'*56}")
         print(f"  Status          : {status}{error}")
         print(f"  File            : {stats['file_name']}")
         print(f"  Size            : {stats['file_size'] / 1e6:.2f} MB")
@@ -160,5 +161,5 @@ class TurboLaneSender:
         adapter_stats = self._adapter.get_stats()
         print(f"  RL decisions    : {adapter_stats.get('total_decisions', 0)}")
         print(f"  Q-table states  : {adapter_stats.get('q_table_states', 0)}")
-        print(f"  Exploration ε   : {adapter_stats.get('exploration_rate', 0):.4f}")
-        print(f"  {'─'*56}\n")
+        print(f"  Exploration eps : {adapter_stats.get('exploration_rate', 0):.4f}")
+        print(f"  {'-'*56}\n")

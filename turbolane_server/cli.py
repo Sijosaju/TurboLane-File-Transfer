@@ -36,7 +36,7 @@ import json
 
 def _setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
-    fmt   = "%(asctime)s  %(levelname)-8s  %(name)s — %(message)s"
+    fmt   = "%(asctime)s  %(levelname)-8s  %(name)s - %(message)s"
     datefmt = "%H:%M:%S"
     logging.basicConfig(level=level, format=fmt, datefmt=datefmt)
     # Quiet noisy loggers unless verbose
@@ -150,7 +150,7 @@ def _print_status(data: dict) -> None:
     total    = data.get('total_chunks', 0)
     bar_len  = 36
     filled   = int(bar_len * pct / 100) if pct else 0
-    bar      = "█" * filled + "░" * (bar_len - filled)
+    bar      = "#" * filled + "-" * (bar_len - filled)
     print(f"  Progress       : [{bar}] {pct:.1f}%")
     print(f"  Chunks         : {received}/{total}")
     print(f"  Output path    : {data.get('output_path', 'N/A')}")
@@ -165,9 +165,8 @@ def _print_status(data: dict) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="turbolane-server",
-        description="TurboLane — RL-optimized parallel TCP file transfer",
+        description="TurboLane - RL-optimized parallel TCP file transfer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -220,16 +219,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Server port (default: 9000)",
     )
     p_send.add_argument(
-        "--streams", type=int, default=16, metavar="N",
-        help="Initial number of parallel TCP streams (default: 16, LAN-optimized)",
+        "--streams", type=int, default=4, metavar="N",
+        help="Initial number of parallel TCP streams (default: 4)",
     )
     p_send.add_argument(
-        "--min-streams", type=int, default=8, metavar="N",
-        help="Minimum streams TurboLane may use (default: 8)",
+        "--min-streams", type=int, default=1, metavar="N",
+        help="Minimum streams TurboLane may use (default: 1)",
     )
     p_send.add_argument(
-        "--max-streams", type=int, default=64, metavar="N",
-        help="Maximum streams TurboLane may use (default: 64)",
+        "--max-streams", type=int, default=8, metavar="N",
+        help=(
+            "Maximum streams TurboLane may use (default: 8). "
+            "On Wi-Fi keep this <= 8; on wired LAN 16-32 is fine."
+        ),
     )
     p_send.add_argument(
         "--model-dir", default="models/dci", metavar="DIR",
@@ -237,7 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_send.add_argument(
         "--interval", type=float, default=2.0, metavar="SECS",
-        help="TurboLane monitoring / decision interval in seconds (default: 2.0, LAN-optimized)",
+        help="TurboLane monitoring / decision interval in seconds (default: 2.0)",
     )
     p_send.add_argument(
         "--timeout", type=float, default=None, metavar="SECS",

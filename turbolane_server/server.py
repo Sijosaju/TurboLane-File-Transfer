@@ -97,13 +97,16 @@ class FileAssembler:
         self.output_path = str(out_path)
 
         with open(self.output_path, "wb") as fh:
-            fh.seek(file_size - 1)
-            fh.write(b"\x00")
+            if file_size > 0:
+                fh.seek(file_size - 1)
+                fh.write(b"\x00")
 
         # Keep file handle open for the lifetime of the transfer.
         # Opening/closing on every chunk write is extremely expensive at high
         # chunk rates — this alone can improve receiver throughput by 20-40%.
         self._fh = open(self.output_path, "r+b")
+        if self.total_chunks == 0:
+            self._complete.set()
 
         logger.info(
             "FileAssembler %s: pre-allocated %s (%d bytes)",
@@ -135,7 +138,7 @@ class FileAssembler:
 
         if done:
             logger.info(
-                "FileAssembler %s: all %d chunks received → %s",
+                "FileAssembler %s: all %d chunks received -> %s",
                 self.transfer_id, self.total_chunks, self.output_path,
             )
             self.close()
@@ -156,13 +159,18 @@ class FileAssembler:
             return len(self._acked)
 
     def get_stats(self) -> dict:
+        progress_pct = (
+            round(self.chunks_received / self.total_chunks * 100, 1)
+            if self.total_chunks
+            else 100.0
+        )
         return {
             "transfer_id":     self.transfer_id,
             "file_name":       self.file_name,
             "file_size":       self.file_size,
             "total_chunks":    self.total_chunks,
             "chunks_received": self.chunks_received,
-            "progress_pct":    round(self.chunks_received / self.total_chunks * 100, 1),
+            "progress_pct":    progress_pct,
             "complete":        self.is_complete,
             "output_path":     self.output_path,
         }
@@ -271,7 +279,7 @@ class StreamHandler:
                         payload=encode_meta({"reason": "A transfer is already in progress"}),
                     )
                     self._conn.sendall(busy_resp)
-                    logger.warning("Rejected new transfer — server busy")
+                    logger.warning("Rejected new transfer - server busy")
                     return
 
                 # Register new assembler and set busy
@@ -328,6 +336,30 @@ class StreamHandler:
     def _handle_done(self) -> None:
         if self._assembler is None:
             return
+        # COMPLETE should only be sent once the receiver has all chunks.
+        if not self._assembler.is_complete:
+            if not self._assembler.wait_complete(timeout=10.0):
+                payload = encode_meta(
+                    {
+                        "error": "transfer_incomplete",
+                        "chunks_received": self._assembler.chunks_received,
+                        "total_chunks": self._assembler.total_chunks,
+                    }
+                )
+                frame = encode_frame(
+                    msg_type=MessageType.ERROR,
+                    stream_id=self._stream_id,
+                    payload=payload,
+                )
+                self._conn.sendall(frame)
+                logger.warning(
+                    "Stream %d: TRANSFER_DONE received before completion (%d/%d chunks)",
+                    self._stream_id,
+                    self._assembler.chunks_received,
+                    self._assembler.total_chunks,
+                )
+                return
+
         complete = encode_frame(
             msg_type=MessageType.COMPLETE,
             stream_id=self._stream_id,
@@ -469,12 +501,12 @@ class TurboLaneServer:
                 for tid in completed:
                     asm = self._assemblers.pop(tid)
                     logger.info(
-                        "Transfer %s complete — %s",
+                        "Transfer %s complete - %s",
                         tid, asm.output_path,
                     )
                     print(
-                        f"\n  ✓ Transfer complete: {asm.file_name}"
-                        f"  ({asm.file_size/1e6:.1f} MB) → {asm.output_path}\n"
+                        f"\n  [OK] Transfer complete: {asm.file_name}"
+                        f"  ({asm.file_size/1e6:.1f} MB) -> {asm.output_path}\n"
                     )
 
                 if completed and not self._assemblers:

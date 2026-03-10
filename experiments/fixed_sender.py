@@ -102,9 +102,9 @@ def _print_summary(result: dict) -> None:
     status = "COMPLETED" if result["success"] else "FAILED"
     error = f" - {result['error']}" if result.get("error") else ""
 
-    print(f"\n  {'─' * 56}")
+    print(f"\n  {'-' * 56}")
     print("  Fixed Baseline Summary")
-    print(f"  {'─' * 56}")
+    print(f"  {'-' * 56}")
     print(f"  Status          : {status}{error}")
     print(f"  File            : {result['file_name']}")
     print(f"  Size            : {result['file_size'] / 1e6:.2f} MB")
@@ -114,7 +114,7 @@ def _print_summary(result: dict) -> None:
     print(f"  Progress        : {result['progress_pct']}%")
     print(f"  Active streams  : {result['active_streams']}")
     print(f"  Fixed streams   : {result['fixed_streams']}")
-    print(f"  {'─' * 56}\n")
+    print(f"  {'-' * 56}\n")
 
 
 def run_fixed_sender(args: argparse.Namespace) -> int:

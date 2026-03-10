@@ -65,8 +65,8 @@ HEADER_SIZE   = struct.calcsize(HEADER_FORMAT)   # 35 bytes
 # IMPORTANT: both sender and receiver must use the same protocol.py.
 # The chunk_size is negotiated in the HELLO frame so an existing
 # transfer is not affected by this change mid-flight.
-CHUNK_SIZE  = 512 * 1024    # 512 KB  (increased from 256 KB for LAN — fewer round-trips)
-RECV_BUFFER = 256 * 1024    # 256 KB  (increased from 64 KB for higher throughput)
+CHUNK_SIZE  = 256 * 1024    # 256 KB (keeps ACK latency and Wi-Fi queueing under control)
+RECV_BUFFER = 256 * 1024    # 256 KB
 
 
 class MessageType(IntEnum):

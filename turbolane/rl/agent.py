@@ -125,7 +125,7 @@ class RLAgent:
 
         logger.info(
             "RLAgent v2 init: connections=[%d..%d] default=%d "
-            "lr=%.3f γ=%.2f ε=%.2f interval=%.1fs actions=%s",
+            "lr=%.3f gamma=%.2f eps=%.2f interval=%.1fs actions=%s",
             min_connections, max_connections, default_connections,
             learning_rate, discount_factor, exploration_rate, monitoring_interval,
             {a: ACTIONS[a] for a in ACTIONS},
@@ -404,7 +404,7 @@ class RLAgent:
         self._action_history.append(action)
 
         logger.info(
-            "Decision #%d: streams=%d action=%d(%+d) ε=%.3f state=%s",
+            "Decision #%d: streams=%d action=%d(%+d) eps=%.3f state=%s",
             self.total_decisions,
             self.current_connections,
             action,
