@@ -200,10 +200,7 @@ class StreamWorker:
             daemon=True,
         )
         self._thread.start()
-        logger.info(
-            "Stream %d: started (pipeline=%d) -> %s:%d",
-            self.stream_id, self._pipeline_depth, self.host, self.port,
-        )
+        
         return True
 
     def send_transfer_done(self) -> bool:
