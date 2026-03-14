@@ -155,6 +155,10 @@ class TurboLaneAdapter:
         rtt        = snap["rtt_ms"]
         loss       = snap["loss_pct"]
 
+        # Keep RL state aligned with the stream count the transfer layer is
+        # actually running, not the raw action the agent proposed last tick.
+        self._engine.sync_current_connections(active_streams)
+
         # --- Phase 1: learn from previous decision's outcome ---
         self._engine.learn(throughput, rtt, loss)
 
@@ -173,13 +177,6 @@ class TurboLaneAdapter:
                 "(loss=%.2f%% rtt=%.0f ms)",
                 new_streams, loss, rtt,
             )
-
-        # Keep stream changes gradual to avoid connection churn on Wi-Fi.
-        delta = new_streams - self._last_decision_streams
-        if delta > 2:
-            new_streams = self._last_decision_streams + 2
-        elif delta < -2:
-            new_streams = self._last_decision_streams - 2
 
         if new_streams != self._last_decision_streams:
             logger.info(

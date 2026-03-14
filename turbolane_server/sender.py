@@ -41,6 +41,7 @@ class TurboLaneSender:
         max_streams:     Maximum streams (passed to TurboLane)
         model_dir:       Directory for Q-table persistence
         monitor_interval: Seconds between TurboLane decisions
+        pipeline_depth:  Per-stream send window for the RL path
         timeout:         Max seconds to wait for transfer completion (None = unlimited)
     """
 
@@ -54,6 +55,7 @@ class TurboLaneSender:
         max_streams: int = 32,
         model_dir: str = "models/dci",
         monitor_interval: float = 5.0,
+        pipeline_depth: int = 2,
         timeout: Optional[float] = None,
     ) -> None:
         if not os.path.isfile(file_path):
@@ -72,6 +74,7 @@ class TurboLaneSender:
         print(f"  Size     : {file_size / 1e6:.2f} MB")
         print(f"  Receiver : {receiver_host}:{receiver_port}")
         print(f"  Streams  : {initial_streams} initial  [{min_streams}..{max_streams}]")
+        print(f"  Pipeline : {pipeline_depth} chunks per stream")
         print(f"  Model    : {model_dir}")
         rl_label = "fast-adapt" if monitor_interval <= 2.0 else "standard"
         print(f"  RL cycle : every {monitor_interval}s  ({rl_label} mode)\n")
@@ -86,6 +89,7 @@ class TurboLaneSender:
             receiver_port=receiver_port,
             num_streams=initial_streams,
             metrics_collector=self._metrics,
+            pipeline_depth=pipeline_depth,
         )
 
         # --- TurboLane adapter (embedded RL engine) ---

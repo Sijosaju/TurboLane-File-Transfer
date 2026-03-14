@@ -114,6 +114,7 @@ class RLAgent:
         # Rolling history for oscillation detection and constraint logic
         self._action_history: deque = deque(maxlen=10)
         self._metrics_history: deque = deque(maxlen=50)
+        self._state_visits: dict[tuple, int] = {}
 
         # Counters for stats and persistence
         self.total_decisions: int = 0
@@ -218,7 +219,9 @@ class RLAgent:
     def _best_action(self, state: tuple) -> int:
         """Return the action with the highest Q-value for this state."""
         self._init_state(state)
-        return max(self.Q[state], key=self.Q[state].__getitem__)
+        best_q = max(self.Q[state].values())
+        best_actions = [a for a, q in self.Q[state].items() if q == best_q]
+        return random.choice(best_actions)
 
     def _max_q(self, state: tuple) -> float:
         self._init_state(state)
@@ -241,10 +244,7 @@ class RLAgent:
         )
 
         # Boost exploration for states seen fewer than 5 times
-        visit_count = sum(
-            1 for m in self._metrics_history
-            if m.get("state") == state
-        )
+        visit_count = self._state_visits.get(state, 0)
         effective_epsilon = (
             min(0.7, self.exploration_rate * 2.0)
             if visit_count < 5
@@ -360,6 +360,18 @@ class RLAgent:
         """True if the monitoring interval has elapsed."""
         return (time.monotonic() - self._last_decision_time) >= self.monitoring_interval
 
+    def sync_current_connections(self, observed_connections: int) -> int:
+        """
+        Force the agent's stream count to the real applied value observed by
+        the transfer layer. This keeps state and reward aligned with reality.
+        """
+        synced = max(
+            self.min_connections,
+            min(self.max_connections, int(observed_connections)),
+        )
+        self.current_connections = synced
+        return synced
+
     def make_decision(
         self,
         throughput_mbps: float,
@@ -384,6 +396,7 @@ class RLAgent:
             return self.current_connections
 
         state = self._discretize(throughput_mbps, rtt_ms, loss_pct)
+        self._state_visits[state] = self._state_visits.get(state, 0) + 1
         action = self.choose_action(state)
         new_connections = self._apply_action(action, self.current_connections)
 
@@ -488,6 +501,7 @@ class RLAgent:
         )
         return {
             "q_table_states": len(self.Q),
+            "observed_states": len(self._state_visits),
             "current_connections": self.current_connections,
             "exploration_rate": round(self.exploration_rate, 4),
             "total_decisions": self.total_decisions,
@@ -508,6 +522,7 @@ class RLAgent:
         self._last_metrics = None
         self._action_history.clear()
         self._metrics_history.clear()
+        self._state_visits.clear()
         self.total_decisions = 0
         self.total_updates = 0
         self._total_reward = 0.0

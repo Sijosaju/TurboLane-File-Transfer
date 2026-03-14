@@ -80,6 +80,7 @@ def cmd_send(args: argparse.Namespace) -> int:
             max_streams=args.max_streams,
             model_dir=args.model_dir,
             monitor_interval=args.interval,
+            pipeline_depth=args.pipeline_depth,
             timeout=args.timeout,
         )
     except FileNotFoundError as exc:
@@ -240,6 +241,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument(
         "--interval", type=float, default=2.0, metavar="SECS",
         help="TurboLane monitoring / decision interval in seconds (default: 2.0)",
+    )
+    p_send.add_argument(
+        "--pipeline-depth", type=int, default=2, metavar="N",
+        help="Per-stream in-flight chunk window for the RL sender (default: 2)",
     )
     p_send.add_argument(
         "--timeout", type=float, default=None, metavar="SECS",

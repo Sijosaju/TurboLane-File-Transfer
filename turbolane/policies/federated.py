@@ -72,18 +72,24 @@ class _AdaptiveRange:
         decay_fast: float = 0.85,
         warmup: int = 5,
         min_spread: float = 1.0,
+        freeze_after: int | None = 40,
     ):
         self.n_bins = n_bins
         self.decay_slow = decay_slow
         self.decay_fast = decay_fast
         self.warmup = warmup
         self.min_spread = min_spread
+        self.freeze_after = freeze_after
         self.obs_min: float | None = None   # None until first observation
         self.obs_max: float | None = None
         self._count: int = 0
+        self._frozen: bool = False
 
     def update(self, value: float) -> None:
         """Feed a new observation to update the tracked range."""
+        if self._frozen:
+            return
+
         self._count += 1
 
         # Bootstrap from first real observation
@@ -94,6 +100,7 @@ class _AdaptiveRange:
             if self.obs_max - self.obs_min < self.min_spread:
                 self.obs_min = 0.0
                 self.obs_max = self.min_spread
+            self._maybe_freeze()
             return
 
         # Fast convergence during warmup, slow tracking after
@@ -115,6 +122,12 @@ class _AdaptiveRange:
             self.obs_min = mid - self.min_spread / 2.0
             self.obs_max = mid + self.min_spread / 2.0
 
+        self._maybe_freeze()
+
+    def _maybe_freeze(self) -> None:
+        if self.freeze_after is not None and self._count >= self.freeze_after:
+            self._frozen = True
+
     def discretize(self, value: float) -> int:
         """Map value to bucket index in [0, n_bins-1]."""
         if self.obs_min is None:
@@ -123,12 +136,34 @@ class _AdaptiveRange:
         frac = max(0.0, min(1.0, (value - self.obs_min) / span))
         return min(int(frac * self.n_bins), self.n_bins - 1)
 
+    def export_state(self) -> dict:
+        return {
+            "obs_min": self.obs_min,
+            "obs_max": self.obs_max,
+            "count": self._count,
+            "frozen": self._frozen,
+            "freeze_after": self.freeze_after,
+            "min_spread": self.min_spread,
+        }
+
+    def restore_state(self, state: dict) -> None:
+        self.obs_min = state.get("obs_min")
+        self.obs_max = state.get("obs_max")
+        self._count = int(state.get("count", 0))
+        self._frozen = bool(state.get("frozen", False))
+        freeze_after = state.get("freeze_after")
+        if freeze_after is not None:
+            self.freeze_after = int(freeze_after)
+        min_spread = state.get("min_spread")
+        if min_spread is not None:
+            self.min_spread = float(min_spread)
+
     def __repr__(self) -> str:
         if self.obs_min is None:
             return f"AdaptiveRange(uninitialized, bins={self.n_bins})"
         return (
             f"AdaptiveRange(min={self.obs_min:.1f}, max={self.obs_max:.1f}, "
-            f"bins={self.n_bins}, step={self._count})"
+            f"bins={self.n_bins}, step={self._count}, frozen={self._frozen})"
         )
 
 
@@ -161,12 +196,14 @@ class FederatedPolicy:
         loss_target_pct: float = 0.5,   # loss budget (%)
         stream_target: int = 20,         # reference optimal stream count
         peak_window: int = 10,           # rolling window for dynamic peak
+        range_freeze_after: int = 40,
     ):
         self._auto_save_every = auto_save_every
         self._min_connections = min_connections
         self._max_connections = max_connections
         self.loss_target_pct = max(0.01, float(loss_target_pct))
         self.stream_target = max(1, int(stream_target))
+        self._range_freeze_after = max(1, int(range_freeze_after))
 
         # Adaptive range trackers — self-calibrate from first real observation
         self._tput_range = _AdaptiveRange(
@@ -175,6 +212,7 @@ class FederatedPolicy:
             decay_fast=0.85,
             warmup=5,
             min_spread=5.0,    # at least 5 Mbps spread
+            freeze_after=self._range_freeze_after,
         )
         self._rtt_range = _AdaptiveRange(
             n_bins=_RTT_BINS,
@@ -182,6 +220,7 @@ class FederatedPolicy:
             decay_fast=0.85,
             warmup=5,
             min_spread=10.0,   # at least 10 ms spread
+            freeze_after=self._range_freeze_after,
         )
 
         # Dynamic peak for reward normalisation
@@ -237,7 +276,7 @@ class FederatedPolicy:
             self.save()
 
     def save(self) -> bool:
-        return self._storage.save(self._agent.Q, self._agent.get_stats())
+        return self._storage.save(self._agent.Q, self.get_stats())
 
     def get_stats(self) -> dict:
         stats = self._agent.get_stats()
@@ -246,6 +285,8 @@ class FederatedPolicy:
         stats["rolling_peak_mbps"] = round(self._rolling_peak, 2)
         stats["tput_range"] = repr(self._tput_range)
         stats["rtt_range"] = repr(self._rtt_range)
+        stats["tput_range_state"] = self._tput_range.export_state()
+        stats["rtt_range_state"] = self._rtt_range.export_state()
         return stats
 
     def reset(self) -> None:
@@ -254,8 +295,16 @@ class FederatedPolicy:
         self._rolling_peak = 1.0
         self._prev_tput = 0.0
         # Reset adaptive ranges (they re-seed from next observation)
-        self._tput_range = _AdaptiveRange(n_bins=_TPUT_BINS, min_spread=5.0)
-        self._rtt_range  = _AdaptiveRange(n_bins=_RTT_BINS,  min_spread=10.0)
+        self._tput_range = _AdaptiveRange(
+            n_bins=_TPUT_BINS,
+            min_spread=5.0,
+            freeze_after=self._range_freeze_after,
+        )
+        self._rtt_range  = _AdaptiveRange(
+            n_bins=_RTT_BINS,
+            min_spread=10.0,
+            freeze_after=self._range_freeze_after,
+        )
         logger.info("FederatedPolicy: agent state reset")
 
     # -----------------------------------------------------------------------
@@ -269,6 +318,9 @@ class FederatedPolicy:
     @property
     def agent(self) -> RLAgent:
         return self._agent
+
+    def sync_current_connections(self, observed_connections: int) -> int:
+        return self._agent.sync_current_connections(observed_connections)
 
     # -----------------------------------------------------------------------
     # State discretisation — fully adaptive, network-agnostic
@@ -455,6 +507,12 @@ class FederatedPolicy:
             saved_peak = metadata.get("rolling_peak_mbps")
             if saved_peak is not None:
                 self._rolling_peak = float(saved_peak)
+            saved_tput_range = metadata.get("tput_range_state")
+            if isinstance(saved_tput_range, dict):
+                self._tput_range.restore_state(saved_tput_range)
+            saved_rtt_range = metadata.get("rtt_range_state")
+            if isinstance(saved_rtt_range, dict):
+                self._rtt_range.restore_state(saved_rtt_range)
             logger.info(
                 "Restored: %d Q-states, %d decisions, %d updates, eps=%.4f",
                 len(Q), self._agent.total_decisions,

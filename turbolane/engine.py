@@ -160,6 +160,16 @@ class TurboLaneEngine:
         stats["engine_algorithm"] = self.algorithm
         return stats
 
+    def sync_current_connections(self, observed_connections: int) -> int:
+        """
+        Synchronize the policy with the real applied stream count observed by
+        the transfer layer.
+        """
+        sync_fn = getattr(self._policy, "sync_current_connections", None)
+        if sync_fn is None:
+            return self.current_connections
+        return sync_fn(observed_connections)
+
     def reset(self) -> None:
         """Clear the policy's learned state. Does not delete files on disk."""
         self._policy.reset()

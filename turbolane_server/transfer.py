@@ -153,6 +153,7 @@ class StreamWorker:
         file_name: str,
         total_chunks: int,
         file_size: int,
+        pipeline_depth: int = PIPELINE_DEPTH,
     ) -> None:
         self.stream_id     = stream_id
         self.host          = host
@@ -163,6 +164,7 @@ class StreamWorker:
         self._file_name    = file_name
         self._total_chunks = total_chunks
         self._file_size    = file_size
+        self._pipeline_depth = max(1, int(pipeline_depth))
 
         self._stop_event       = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -199,8 +201,8 @@ class StreamWorker:
         )
         self._thread.start()
         logger.info(
-            "Stream %d: started (send-one/wait-ACK) -> %s:%d",
-            self.stream_id, self.host, self.port,
+            "Stream %d: started (pipeline=%d) -> %s:%d",
+            self.stream_id, self._pipeline_depth, self.host, self.port,
         )
         return True
 
@@ -273,6 +275,49 @@ class StreamWorker:
             except OSError:
                 pass
 
+    def _get_live_sock(self) -> Optional[socket.socket]:
+        with self._sock_lock:
+            return self._sock
+
+    def _send_chunk_frame(
+        self,
+        fh,
+        chunk_idx: int,
+        offset: int,
+        length: int,
+    ) -> float:
+        """
+        Send one chunk frame and return the send timestamp.
+        Raises OSError/ConnectionError if the socket is no longer usable.
+        """
+        fh.seek(offset)
+        data = fh.read(length)
+
+        frame = encode_frame(
+            msg_type=MessageType.CHUNK,
+            stream_id=self.stream_id & 0xFFFF,
+            chunk_idx=chunk_idx,
+            total_chunks=self._total_chunks,
+            seq=chunk_idx,
+            file_offset=offset,
+            payload=data,
+        )
+
+        sock = self._get_live_sock()
+        if sock is None:
+            raise OSError("stream socket closed")
+
+        sent_at = time.monotonic()
+        sock.sendall(frame)
+        self._sm.record_bytes(len(data))
+        self._cq.mark_sent()
+        return sent_at
+
+    def _requeue_pending(self, pending: dict[int, dict]) -> None:
+        for chunk_idx, entry in pending.items():
+            if not self._cq.is_acked(chunk_idx):
+                self._cq.requeue(chunk_idx, entry["offset"], entry["length"])
+
     # ------------------------------------------------------------------
     # Internal: HELLO handshake
     # ------------------------------------------------------------------
@@ -312,7 +357,7 @@ class StreamWorker:
 
     def _run(self) -> None:
         """
-        Worker loop: pull chunk -> send -> wait for ACK -> repeat.
+        Worker loop: keep up to pipeline_depth chunks in flight, then drain ACKs.
 
         BUG 1 FIX: entire body in try/except Exception so any unexpected
         error (e.g. file open failure on Windows with special characters in
@@ -323,129 +368,140 @@ class StreamWorker:
         unblocks right away rather than waiting STREAM_TIMEOUT (120 s)
         and then sending WinError 10054 back to the sender.
         """
+        pending: dict[int, dict] = {}
+
         try:
             with open(self._cq.file_path, "rb") as fh:
                 while not self._stop_event.is_set() and not self._cq.is_done:
-
                     self._maybe_ping()
 
-                    item = self._cq.get(timeout=0.5)
-                    if item is None:
-                        continue
-
-                    chunk_idx, offset, length = item
-                    success = False
-
-                    for attempt in range(MAX_CHUNK_RETRIES):
-                        # BUG 5 FIX: honour stop signal without burning retries.
-                        if self._stop_event.is_set():
+                    while (
+                        len(pending) < self._pipeline_depth
+                        and not self._stop_event.is_set()
+                        and not self._cq.is_done
+                    ):
+                        item = self._cq.get(timeout=0.1 if pending else 0.5)
+                        if item is None:
                             break
 
-                        # BUG E FIX: always re-acquire socket under lock immediately
-                        # before sendall.  The receiver thread calls _close_sock()
-                        # which sets self._sock = None; reading sock once at the top
-                        # of the loop gave a stale (non-None) reference that became
-                        # None by the time sendall() was reached, causing:
-                        #   AttributeError: 'NoneType' object has no attribute 'sendall'
-                        with self._sock_lock:
-                            sock = self._sock
-                        if sock is None:
-                            self._stop_event.set()
-                            break
+                        chunk_idx, offset, length = item
 
                         try:
-                            fh.seek(offset)
-                            data = fh.read(length)
-
-                            frame = encode_frame(
-                                msg_type=MessageType.CHUNK,
-                                stream_id=self.stream_id & 0xFFFF,
-                                chunk_idx=chunk_idx,
-                                total_chunks=self._total_chunks,
-                                seq=chunk_idx,
-                                file_offset=offset,
-                                payload=data,
-                            )
-
-                            send_start = time.monotonic()
-
-                            # BUG E FIX: re-check socket under lock just before
-                            # sendall — the receiver thread may have nulled it.
-                            with self._sock_lock:
-                                sock = self._sock
-                            if sock is None:
-                                self._stop_event.set()
-                                break
-
-                            sock.sendall(frame)
-                            self._sm.record_bytes(len(data))
-                            self._cq.mark_sent()
-
-                            # Wait for ACK — tolerate interleaved PONGs.
-                            while True:
-                                hdr, _payload = recv_frame(sock)
-                                if hdr["msg_type"] == MessageType.PONG:
-                                    self._sm.record_pong()
-                                    continue
-                                break
-
-                            if hdr["msg_type"] == MessageType.CHUNK_ACK and hdr["chunk_idx"] == chunk_idx:
-                                self._cq.mark_acked(chunk_idx)
-                                success = True
-                                logger.debug(
-                                    "Stream %d chunk %d ACKed in %.1f ms",
-                                    self.stream_id, chunk_idx,
-                                    (time.monotonic() - send_start) * 1000,
-                                )
-                                break
-                            else:
-                                logger.warning(
-                                    "Stream %d chunk %d: unexpected response %s (attempt %d)",
-                                    self.stream_id, chunk_idx, hdr["msg_type"], attempt + 1,
-                                )
-                                self._sm.record_nack()
-
-                        except socket.timeout:
-                            logger.warning(
-                                "Stream %d chunk %d: ACK timeout (attempt %d/%d)",
-                                self.stream_id, chunk_idx, attempt + 1, MAX_CHUNK_RETRIES,
-                            )
-                            self._sm.record_nack()
-
+                            sent_at = self._send_chunk_frame(fh, chunk_idx, offset, length)
                         except (ConnectionError, OSError) as exc:
-                            # BUG G FIX: WinError 10038 ("operation on something
-                            # that is not a socket") happens when stop() closes
-                            # the socket while this thread still holds a stale
-                            # local `sock` reference and calls recv_frame(sock).
-                            # If stop_event is already set this is an intentional
-                            # shutdown — log at DEBUG not ERROR.
                             if self._stop_event.is_set():
                                 logger.debug(
                                     "Stream %d: socket closed during shutdown (expected): %s",
                                     self.stream_id, exc,
                                 )
                             else:
-                                logger.error(
-                                    "Stream %d: socket error%s: %s",
-                                    self.stream_id,
-                                    " during retry" if attempt > 0 else "",
-                                    exc,
-                                )
-                            # BUG A FIX: close socket immediately so server
-                            # unblocks now rather than after STREAM_TIMEOUT.
+                                logger.error("Stream %d: socket error during send: %s", self.stream_id, exc)
+                            self._cq.requeue(chunk_idx, offset, length)
                             self._close_sock()
                             self._stop_event.set()
                             break
 
-                    if not success and not self._cq.is_acked(chunk_idx):
-                        if not self._cq.is_done:
-                            logger.warning(
-                                "Stream %d chunk %d: not ACKed, requeueing",
-                                self.stream_id, chunk_idx,
-                            )
-                            self._cq.requeue(chunk_idx, offset, length)
-                        if self._stop_event.is_set():
+                        pending[chunk_idx] = {
+                            "offset": offset,
+                            "length": length,
+                            "sent_at": sent_at,
+                            "attempts": 1,
+                        }
+
+                    if not pending:
+                        continue
+
+                    sock = self._get_live_sock()
+                    if sock is None:
+                        self._stop_event.set()
+                        break
+
+                    try:
+                        while True:
+                            hdr, _payload = recv_frame(sock)
+                            if hdr["msg_type"] == MessageType.PONG:
+                                self._sm.record_pong()
+                                continue
                             break
+
+                        if hdr["msg_type"] == MessageType.CHUNK_ACK:
+                            ack_idx = hdr["chunk_idx"]
+                            entry = pending.pop(ack_idx, None)
+                            if entry is None:
+                                logger.debug(
+                                    "Stream %d: ACK for unknown chunk %d ignored",
+                                    self.stream_id, ack_idx,
+                                )
+                                continue
+
+                            self._cq.mark_acked(ack_idx)
+                            logger.debug(
+                                "Stream %d chunk %d ACKed in %.1f ms",
+                                self.stream_id, ack_idx,
+                                (time.monotonic() - entry["sent_at"]) * 1000,
+                            )
+                            continue
+
+                        logger.warning(
+                            "Stream %d: unexpected response while %d chunks in flight: %s",
+                            self.stream_id, len(pending), hdr["msg_type"],
+                        )
+                        self._sm.record_nack()
+
+                    except socket.timeout:
+                        oldest_idx, oldest = next(iter(pending.items()))
+                        if oldest["attempts"] >= MAX_CHUNK_RETRIES:
+                            logger.error(
+                                "Stream %d chunk %d: ACK timeout after %d attempts",
+                                self.stream_id, oldest_idx, oldest["attempts"],
+                            )
+                            self._sm.record_nack()
+                            self._requeue_pending(pending)
+                            pending.clear()
+                            self._close_sock()
+                            self._stop_event.set()
+                            break
+
+                        try:
+                            resent_at = self._send_chunk_frame(
+                                fh,
+                                oldest_idx,
+                                oldest["offset"],
+                                oldest["length"],
+                            )
+                        except (ConnectionError, OSError) as exc:
+                            logger.error(
+                                "Stream %d chunk %d: resend failed: %s",
+                                self.stream_id, oldest_idx, exc,
+                            )
+                            self._sm.record_nack()
+                            self._requeue_pending(pending)
+                            pending.clear()
+                            self._close_sock()
+                            self._stop_event.set()
+                            break
+
+                        oldest["attempts"] += 1
+                        oldest["sent_at"] = resent_at
+                        self._sm.record_nack()
+                        logger.warning(
+                            "Stream %d chunk %d: ACK timeout, resending (%d/%d)",
+                            self.stream_id, oldest_idx, oldest["attempts"], MAX_CHUNK_RETRIES,
+                        )
+
+                    except (ConnectionError, OSError) as exc:
+                        if self._stop_event.is_set():
+                            logger.debug(
+                                "Stream %d: socket closed during shutdown (expected): %s",
+                                self.stream_id, exc,
+                            )
+                        else:
+                            logger.error("Stream %d: socket error: %s", self.stream_id, exc)
+                        self._requeue_pending(pending)
+                        pending.clear()
+                        self._close_sock()
+                        self._stop_event.set()
+                        break
 
         except Exception as exc:
             # BUG 1 FIX: catch anything unexpected and log it.
@@ -455,6 +511,9 @@ class StreamWorker:
             )
             self._close_sock()
             self._stop_event.set()
+
+        if pending and not self._cq.is_done:
+            self._requeue_pending(pending)
 
         logger.info("Stream %d: worker loop exited", self.stream_id)
 
@@ -493,6 +552,7 @@ class TransferSession:
         num_streams: int,
         metrics_collector: MetricsCollector,
         transfer_id: Optional[str] = None,
+        pipeline_depth: int = PIPELINE_DEPTH,
     ) -> None:
         self.file_path     = file_path
         self.receiver_host = receiver_host
@@ -512,6 +572,7 @@ class TransferSession:
         self._done_event  = threading.Event()
         self._error: Optional[str] = None
         self._next_stream_id = 0
+        self._pipeline_depth = max(1, int(pipeline_depth))
 
         self._monitor_thread: Optional[threading.Thread] = None
 
@@ -639,6 +700,7 @@ class TransferSession:
             file_name=self._file_name,
             total_chunks=self._chunk_queue.total_chunks,
             file_size=self._file_size,
+            pipeline_depth=self._pipeline_depth,
         )
         ok = worker.start()
         if ok:
