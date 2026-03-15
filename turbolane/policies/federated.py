@@ -2,38 +2,6 @@
 turbolane/policies/federated.py
 
 FederatedPolicy — the policy wrapper for data center / DCI environments.
-
-FIXES applied (v3 — adaptive self-calibrating bins):
-
-  PROBLEM BEING SOLVED:
-    Hardcoded bin boundaries are the root cause of state collapse.
-    With fixed bins, any network whose operating range doesn't align
-    with the boundaries will collapse all observations into 1–2 bins,
-    making Q-learning impossible regardless of the reward design.
-    This was confirmed by your logs: 100% of throughput samples (113–185 Mbps)
-    fell into one bin, 77% of RTT samples (>600 ms) fell into one bin.
-    Result: only 3 unique states discovered across 10 full episodes.
-
-  SOLUTION — Two-phase adaptive binning:
-    The _AdaptiveRange class tracks the observed [min, max] of each signal.
-    Bin boundaries are computed as equal fractions of this observed range,
-    not hardcoded constants.
-
-    Phase 1 (warmup, first 5 steps): fast decay (0.85) so the range
-    converges quickly to the actual operating region.
-
-    Phase 2 (steady state): slow decay (0.997) so the range follows
-    long-term network changes without forgetting history.
-
-    This works for ANY throughput range — 5 Mbps, 50 Mbps, 500 Mbps —
-    without any configuration change.
-
-  OTHER FIXES retained from v2:
-    - Stream count as 4th state dimension
-    - Loss bins remain fixed (absolute thresholds ARE meaningful)
-    - Actions: ±5, ±1, 0  (matching the paper exactly)
-    - Reward positive by default during healthy operation
-    - RTT penalty also adaptive (fires only in top 15% of observed RTT range)
 """
 
 import logging

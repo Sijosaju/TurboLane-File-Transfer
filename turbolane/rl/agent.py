@@ -3,33 +3,6 @@ turbolane/rl/agent.py
 
 Q-Learning agent for optimizing parallel TCP stream count.
 
-Design principles:
-- State: discretized (throughput_level, rtt_level, loss_level, stream_level) tuple
-- Actions: 5 discrete actions matching paper's design (±5, ±1, hold)
-- Reward: computed by FederatedPolicy (throughput-first, positive by default)
-- No application code. No sockets. No file I/O. Pure RL logic.
-
-FIXES applied (v2):
-  1. Actions updated to match the paper exactly: ±5 (aggressive), ±1 (conservative), 0.
-     Old actions were ±2 and ±1 which is too slow for the 1-32 stream range.
-     The paper explicitly uses +5 and -5 for fast convergence (40% faster claim).
-
-  2. State is now 4-dimensional: (throughput, rtt, loss, stream_count).
-     Old 3D state caused total collapse to 1-3 states across 10 episodes.
-     Adding stream_count as a dimension multiplies the state space by 5,
-     enabling the agent to distinguish (high_tput, 10_streams) from (high_tput, 25_streams).
-
-  3. Oscillation detection window widened to 6 steps (was 4).
-     With ±5 actions the agent moves faster so oscillation is more visible.
-
-  4. Exploration boost threshold raised to 5 visits (was 3).
-     With 5x more states each state is visited less often — needs more boost.
-
-  5. Q-value clip widened to [-20, 20] (was [-10, 10]).
-     The new reward range is [-3, 3] per step; tighter clips stunted learning.
-
-  6. Adaptive learning rate threshold raised to 0.5 (was 1.0) to catch
-     the smaller reward magnitudes that occur during normal positive operation.
 """
 
 import random
